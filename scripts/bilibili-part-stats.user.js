@@ -2,7 +2,7 @@
 // @name         Bilibili 分P数据补全
 // @name:en      Bilibili Part Stats
 // @namespace    https://github.com/kyo-zzz/bili-part-stats
-// @version      0.2.2
+// @version      0.3.0
 // @description  在 B 站视频标题下方补齐「每个分 P」的弹幕数与在线观看人数，补回官方改版后丢失的展示。
 // @description:en  Restores the per-part danmaku count and live viewer count below the video title on bilibili.com.
 // @author       kyo-zzz
@@ -216,63 +216,97 @@
   }
 
   /**
-   * 遍历所有可能藏着分P列表的来源。命中就把结果记在源对象上（B 站替换掉
-   * 整个状态对象时记忆自动失效），未命中则 5 秒内不重复扫。
+   * 遍历所有可能藏着分P列表的来源。
+   *
+   * 关键设计：B 站是 SPA，页面首屏数据可能在 document-idle 之后才异步水合，
+   * 所以这里**不能**用长时间负缓存把「暂时取不到」记成「永远取不到」。
+   * 结果是按输入签名缓存的——签名变了就重扫，这样数据一水合进来就能立刻命中。
    */
   const STATE_KEYS = [
     '__INITIAL_STATE__', 'videoData', '__NEXT_DATA__', '__NUXT__',
     '__INITIAL_DATA__', '__state__',
   ];
 
-  function collectStateRoots() {
+  // 内联 script 的解析结果按签名缓存：几个 MB 的脚本不该每秒重新 JSON.parse
+  let inlineSig = null;
+  let inlineRoots = [];
+
+  function scanInlineScripts() {
+    let scripts = [];
+    try { scripts = Array.prototype.slice.call(document.querySelectorAll('script')); }
+    catch (_) { return []; }
+    let sig = scripts.length + ' ';
+    const interesting = [];
+    for (let i = 0; i < scripts.length; i++) {
+      const s = scripts[i];
+      const t = (typeof s.textContent === 'string') ? s.textContent : '';
+      if (t.length >= 40 && t.length <= 3000000 &&
+          (t.indexOf('__INITIAL_STATE__') >= 0 || t.indexOf('videoData') >= 0)) {
+        sig += i + ':' + t.length + ';';
+        interesting.push(t);
+      }
+    }
+    if (sig === inlineSig) return inlineRoots;
+    inlineSig = sig;
+    inlineRoots = [];
+    for (let i = 0; i < interesting.length; i++) {
+      const t = interesting[i];
+      let raw = null;
+      // 形式：window.__INITIAL_STATE__ = {...}
+      const m = t.match(/__INITIAL_STATE__\s*[:=]\s*([\s\S]+)/);
+      if (m) { try { raw = JSON.parse(m[1].replace(/[;,]\s*$/, '')); } catch (_) {} }
+      if (!raw) { try { raw = JSON.parse(t); } catch (_) {} }
+      if (raw) inlineRoots.push(raw);
+    }
+    return inlineRoots;
+  }
+
+  function gatherRoots() {
+    let sig = '';
     const roots = [];
     for (let i = 0; i < STATE_KEYS.length; i++) {
       let v = null;
       try { v = window[STATE_KEYS[i]]; } catch (_) {}
-      if (v) roots.push(v);
+      if (v) {
+        // 已命中的对象带 memo 标记，签名会因此变化，从而走到快速返回分支
+        sig += STATE_KEYS[i] + (v.__bPsVideoMemo ? '/H' : '/?');
+        roots.push(v);
+      } else {
+        sig += '0';
+      }
     }
-    // B 站有时不给 script 加 id，而是直接 window.__INITIAL_STATE__ = {...}
-    let scripts = [];
-    try { scripts = Array.prototype.slice.call(document.querySelectorAll('script')); } catch (_) {}
-    for (let i = 0; i < scripts.length; i++) {
-      const s = scripts[i];
-      const t = s && s.textContent;
-      if (typeof t !== 'string' || t.length < 40 || t.length > 3000000) continue;
-      if (t.indexOf('__INITIAL_STATE__') < 0 && t.indexOf('videoData') < 0) continue;
-      let raw = null;
-      const m = t.match(/__INITIAL_STATE__\s*[:=]\s*([\s\S]+)/);
-      if (m) { try { raw = JSON.parse(m[1].replace(/[;,]\s*$/, '')); } catch (_) {} }
-      if (!raw) { try { raw = JSON.parse(t); } catch (_) {} }
-      if (raw) roots.push(raw);
-    }
-    return roots;
+    const scriptRoots = scanInlineScripts();
+    sig += '|' + scriptRoots.length + '|' + inlineSig + '|';
+    for (let i = 0; i < scriptRoots.length; i++) roots.push(scriptRoots[i]);
+    return { sig: sig, roots: roots };
   }
+
+  let scanSig = null;
+  let scanHit = null;
 
   /**
    * 第一优先：直接读页面已加载的初始状态，不发任何请求。
-   *
-   * 这条路径是整个脚本的地基——命中它就不需要任何网络请求，
-   * 也就不受登录态、风控、CORS 的影响。
+   * 命中它就不需要任何网络请求，也就不受登录态、风控、CORS 的影响。
    */
-  let stateNegUntil = 0;
-
   function readInitialState() {
-    if (Date.now() < stateNegUntil) return null;
-    let roots = [];
-    try { roots = collectStateRoots(); } catch (_) { return null; }
-    for (let i = 0; i < roots.length; i++) {
-      let r = roots[i];
+    let g;
+    try { g = gatherRoots(); } catch (_) { return null; }
+    if (g.sig === scanSig) return scanHit;
+    scanSig = g.sig;
+    scanHit = null;
+    for (let i = 0; i < g.roots.length; i++) {
+      let r = g.roots[i];
       if (typeof r === 'string') { try { r = JSON.parse(r); } catch (_) { continue; } }
       if (!r || typeof r !== 'object') continue;
-      if (r.__bPsVideoMemo) return r.__bPsVideoMemo;
+      if (r.__bPsVideoMemo) { scanHit = r.__bPsVideoMemo; break; }
       const hit = scanForVideo(r, 0);
       if (hit) {
         try { r.__bPsVideoMemo = hit; } catch (_) {}
-        return hit;
+        scanHit = hit;
+        break;
       }
     }
-    stateNegUntil = Date.now() + 5000;
-    return null;
+    return scanHit;
   }
 
   /* ------------------- 兜底源：直接从 DOM 分P选择器抓 ------------------- */
@@ -343,6 +377,55 @@
   }
 
   /** 一页文字就够用的诊断串：下次反馈能直接定位，不用再来回猜 */
+  /* ---------------- 兜底源：只抠出当前分P，按单分P处理 ---------------- */
+
+  const CID_RE = /[?&](?:cid|oid)=(\d{5,})/;
+
+  /**
+   * 从 performance 资源条目里抠 cid：B 站自己的播放器请求就带着 cid，
+   * 不需要任何网络往返。这是「拿不到分P列表但有当前分P」时唯一的本地来源。
+   */
+  function cidsFromPerf() {
+    let entries = [];
+    try { entries = performance.getEntriesByType('resource'); } catch (_) { return []; }
+    const out = [];
+    const seen = {};
+    for (let i = 0; i < entries.length; i++) {
+      const m = String(entries[i].name || '').match(CID_RE);
+      if (m && !seen[m[1]]) { seen[m[1]] = true; out.push(m[1]); }
+    }
+    return out;
+  }
+
+  /** 播放器自身的时长，比从文本里猜可靠 */
+  function videoDuration() {
+    let v = null;
+    try { v = document.querySelector('video'); } catch (_) { return 0; }
+    if (!v) return 0;
+    const d = Number(v.duration) || 0;
+    return isFinite(d) && d > 0 ? Math.floor(d) : 0;
+  }
+
+  /**
+   * 降级来源：页面上既没有初始状态、也没有分P标签，但播放器请求里带了 cid。
+   * 这通常意味着**单分P视频**（页面上本来就不渲染 P 标签），
+   * 那就按单分P处理——弹幕数等于全片弹幕数，照样能显示。
+   */
+  function collectPartial() {
+    const cids = cidsFromPerf();
+    if (!cids.length) return null;
+    const dur = videoDuration();
+    const pages = cids.map(function (cid, i) {
+      return { cid: cid, page: i + 1, part: '', duration: dur };
+    });
+    return {
+      bvid: currentBvid(),
+      title: documentTitle(),
+      pages: pages,
+      totalDanmaku: readTotalDanmaku(),
+    };
+  }
+
   function diagnose() {
     const p = [];
     let st = null;
@@ -360,6 +443,11 @@
     try { ncid = document.querySelectorAll('[data-cid]').length; } catch (_) {}
     p.push('script标签' + ns + '(带INITIAL_STATE__的id=' + nid + ')');
     p.push('[data-cid]元素' + ncid);
+    const pc = cidsFromPerf();
+    p.push('perf里的cid=' + (pc.length ? pc.join(',') : 0));
+    let nv = 0;
+    try { nv = document.querySelectorAll('video').length; } catch (_) {}
+    p.push('video元素' + nv + '(时长' + videoDuration() + 's)');
     p.push('bvid=' + (currentBvid() || '(未取到)'));
     const t = documentTitle();
     p.push('title=' + (t ? t.slice(0, 24) : '(空)'));
@@ -389,6 +477,9 @@
     }
     const fromDom = collectFromDom(bvid);
     if (fromDom && fromDom.pages.length) return fromDom;
+
+    const partial = collectPartial();
+    if (partial && partial.pages.length) return partial;
 
     try {
       data = await fetchView(bvid);
@@ -509,12 +600,21 @@
 #b-ps-bar{
   --b-ps-accent:#00AEEC; --b-ps-text:#61666d; --b-ps-strong:#18191c;
   --b-ps-line:#e3e5e7; --b-ps-bg:#f6f7f8;
-  display:flex; flex-wrap:wrap; align-items:center; gap:8px;
-  margin:6px 0 2px; padding:5px 0; font-size:12px; line-height:1.5;
+  display:inline-block; width:22px; height:22px; line-height:22px;
+  margin:0 2px; padding:0; vertical-align:baseline;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",
               Arial,"PingFang SC","Microsoft YaHei",sans-serif;
   color:var(--b-ps-text);
+  cursor:pointer;
 }
+/* 图标本身是「ⓘ」文字，用 text-indent 把它挪出可视区，只留一个小蓝点占位。
+   这样既保留可点区域，又不依赖字体渲染出图形，任何字体都能稳定显示。 */
+#b-ps-bar::before{
+  content:"i"; display:inline-block; width:22px; height:22px; border-radius:50%;
+  background:var(--b-ps-accent); color:#fff; font-size:13px; font-weight:700;
+  line-height:22px; text-align:center; font-style:normal;
+}
+#b-ps-bar:hover{ opacity:.85; }
 .b-ps-chip{
   display:inline-flex; align-items:center; gap:5px; white-space:nowrap;
   padding:2px 8px; border-radius:4px; background:var(--b-ps-bg);
@@ -558,9 +658,13 @@
   position:fixed; left:12px; top:70px; z-index:999999; max-width:62vw;
 }
 #b-ps-bar.is-notice{
+  display:flex; flex-wrap:wrap; align-items:center; gap:8px;
+  position:static; vertical-align:initial; cursor:default;
   background:#fffbe6; border:1px solid #ffe58f; border-radius:6px;
-  padding:6px 10px; font-size:12px; line-height:1.5;
+  padding:6px 10px; margin:6px 0 2px; font-size:12px; line-height:1.5;
 }
+#b-ps-bar.is-notice::before{ content:none; }
+#b-ps-bar.is-notice .b-ps-btn{ display:inline-flex; }
 #b-ps-bar.is-notice.is-bad{ background:#fff1f0; border-color:#ffa39e; }
 `;
 
@@ -741,23 +845,17 @@
     // 清掉 showError / showPaused 留下的通知样式；is-float 由 mount / mountFloating 管理
     bar.style.cssText = '';
     bar.classList.remove('is-notice', 'is-bad');
-    const cur = state.current;
-    const multi = v.pages.length > 1;
-    bar.innerHTML =
-      '<span class="b-ps-tag">P' + cur.page +
-        (cur.part ? ' · ' + escapeHtml(trunc(cur.part, 18)) : '') + '</span>' +
-      '<span class="b-ps-chip is-cur">弹幕 <b class="b-ps-num">' + cellDanmaku(cur.cid) + '</b></span>' +
-      '<span class="b-ps-chip">在线 <b class="b-ps-num">' + cellViewers(cur.cid) + '</b></span>' +
-      (multi
-        ? '<span class="b-ps-btn" data-act="toggle">全部分P（' + v.pages.length + '） ▾</span>' +
-          '<span class="b-ps-btn" data-act="count-all">统计全部分P</span>'
-        : '') +
-      '<span class="b-ps-btn" data-act="refresh">刷新</span>';
+    // v0.3 起：整个栏就是一个可点的图标，本身不再有任何文本内容。
+    // 数据、按钮、总弹幕数全部住在面板里；点这个图标展开面板，
+    // 点面板里「×」收起。展开 / 收起靠 wire() 里的 click 委托判断。
+    bar.innerHTML = '';
   }
 
   function renderPanel(v) {
     const panel = document.getElementById(PANEL_ID);
     if (!panel) return;
+    const multi = v.pages.length > 1;
+    const cur = state.current;
     const rows = v.pages
       .map((p) =>
         '<tr class="b-ps-row' + (p.cid === state.current.cid ? ' b-ps-cur' : '') + '" data-cid="' + p.cid + '">' +
@@ -774,6 +872,12 @@
         '<h3>' + escapeHtml(trunc(v.title, 30)) + '</h3>' +
         '<span class="b-ps-meta">全片总弹幕 <b>' +
           (v.totalDanmaku ? fmt(v.totalDanmaku) : '<span class="b-ps-dash">—</span>') + '</b></span>' +
+        '<span class="b-ps-chip is-cur">当前弹幕 <b class="b-ps-num">' + cellDanmaku(cur.cid) + '</b></span>' +
+        '<span class="b-ps-chip">当前在线 <b class="b-ps-num">' + cellViewers(cur.cid) + '</b></span>' +
+        (multi
+          ? '<span class="b-ps-btn" data-act="count-all">统计全部分P</span>' +
+            '<span class="b-ps-btn" data-act="refresh">刷新</span>'
+          : '') +
         '<span class="b-ps-close" data-act="toggle" style="margin-left:auto" title="收起">×</span>' +
       '</div>' +
       '<div class="b-ps-scroll"><table class="b-ps-table">' +
@@ -858,6 +962,12 @@
           saveStore({ config: Object.assign({}, c, { enabled: true }) });
           void rebuild();
         }
+        return;
+      }
+      // v0.3：图标栏本身没按钮了，点击整块栏就是「展开/收起面板」。
+      // 但要放行面板里数据行的点击（那走 jumpToCid），所以先排掉 #b-ps-panel。
+      if (e.target.closest('#b-ps-bar') && !e.target.closest('#b-ps-panel')) {
+        togglePanel();
         return;
       }
       const row = e.target.closest('.b-ps-row');
@@ -967,6 +1077,9 @@
   let pausedQuiet = false;
   // 最近一次失败时的诊断串，供「复制」按钮用
   let lastDiag = '';
+  // 每个 bvid 的重试计数，以及最近一次未解决的就地错误
+  const loadTries = new Map();
+  let lastError = '';
 
   async function rebuild() {
     if (!cfg().enabled) {
@@ -977,6 +1090,12 @@
     injectCss();
     const bvid = currentBvid();
     if (!bvid) return hideAll();
+
+    // B 站 SPA 重绘可能把我们的元素整个挤掉。
+    // 但只在重试跑完之后补回去——重试还没跑完就补，等于把宽限期抵消掉。
+    if (lastError && !loadTries.has(bvid) && !document.getElementById(BAR_ID)) {
+      showError(lastError);
+    }
 
     if (state.video && state.video.bvid === bvid) {
       await syncCurrent();
@@ -992,15 +1111,28 @@
     state.busy.clear();
     state.panelOpen = false;
 
+    const tries = loadTries.get(bvid) || 0;
     try {
       state.video = await loadVideo(bvid);
+      loadTries.delete(bvid);
+      lastError = null;
     } catch (err) {
+      const msg = err && err.message ? err.message : String(err);
+      lastError = '取不到视频数据（' + msg + '）';
+      // 首屏数据可能在 document-idle 之后才异步水合，
+      // 上来就报错会跟水合抢时间。先退避重试，重试完再报错。
+      const backoff = [300, 800, 2000];
+      if (tries < backoff.length) {
+        loadTries.set(bvid, tries + 1);
+        setTimeout(function () { void rebuild(); }, backoff[tries]);
+        return;
+      }
+      loadTries.delete(bvid);
       if (noticeUntil > Date.now()) return;
       noticeUntil = Date.now() + 30000;
-      const msg = err && err.message ? err.message : String(err);
       console.warn('[bilibili-part-stats] 视频数据加载失败：', err);
       // 显示不出来就必须说清楚为什么，而不是留一片空白让人猜
-      return showError('取不到视频数据（' + msg + '）');
+      return showError(lastError);
     }
     if (!state.video.pages.length) {
       if (noticeUntil <= Date.now()) {

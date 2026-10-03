@@ -4,7 +4,7 @@
 > 单文件 Tampermonkey 脚本，零依赖、零构建，复制到浏览器即用。
 
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![version](https://img.shields.io/badge/version-0.2.2-green.svg)](./scripts/bilibili-part-stats.user.js)
+[![version](https://img.shields.io/badge/version-0.3.0-green.svg)](./scripts/bilibili-part-stats.user.js)
 [![tampermonkey](https://img.shields.io/badge/Tampermonkey-userscript-orange.svg)](https://www.tampermonkey.net/)
 
 ---
@@ -124,18 +124,23 @@ git push -u origin main
 
 ## 使用
 
-脚本分两层，都在**视频标题正下方**：
+脚本 UI 分两层，都锚在**视频标题那一行**上：
 
-**主栏（常驻）** —— 紧接标题的一行，显示当前分 P 的序号、标题、弹幕数、在线观看人数，
-右侧是操作按钮。
+**小图标（常驻，就挂在标题文字后面）** —— 一个 22×22 的蓝色 ⓘ 圆点，紧贴标题末尾。
+它**不显示任何文字**，只是让你知道脚本在跑、点一下就有详情。这是 v0.3 改动的核心：
+之前常驻的「P2 · 弹幕 35 · 在线 —」那条一直压在标题下面，跟 B 站自己的「标题栏 + 统计行」
+叠在一起很挤；改成一个小图标之后，页面几乎看不出插件的存在，只有点开的瞬间才展开内容。
 
-**明细面板（点开才出现）** —— 点主栏上的「全部分P（N）▾」，表格展开在**主栏正下方**，
-把 B 站自己的统计行往下顶。表格列出每个分 P 的标题 / 时长 / 弹幕数 / 在线观看人数，
-当前分 P 高亮，点任意一行直接跳到该分 P。
+**明细面板（点开才出现）** —— 点图标，面板在标题下方弹出一个白底小卡片，包含：
+
+- 头部：视频标题、全片总弹幕数、当前分P的弹幕数 / 在线人数两个 chip、
+  多分P时出现「统计全部分P」和「刷新」按钮，右上角「×」收起
+- 表格：每个分 P 的标题 / 时长 / 弹幕数 / 在线观看人数，当前分 P 高亮，
+  点任意一行直接跳到该分 P
 
 操作说明：
 
-- **「全部分P（N）▾」** / 面板右上角「×」：展开 / 收起明细面板
+- **点图标 / 点「×」**：展开 / 收起面板
 - **「统计全部分P」**：逐 P 排队统计（每个 P 约 5~20 次请求，带限速），并**自动展开面板**
 - **「刷新」**：丢弃缓存重新取数
 - Tampermonkey 图标菜单：`刷新当前视频数据` / `立即统计全部分P` / `关闭 / 开启分P数据栏`
@@ -147,7 +152,7 @@ git push -u origin main
 
 | 你看到的 | 含义 | 怎么办 |
 |---|---|---|
-| 标题下方正常一行 | 一切正常 | —— |
+| 标题文字后面挂着一个蓝色 ⓘ 小圆点 | 一切正常，点开看数据 | 点击图标展开面板 |
 | 左下角黄条：`分P数据 未显示 · 取不到视频数据（…）` | 页面自己的初始状态里取不到分P列表，回退到接口也被拒 | 点「重试」；仍失败把括号里的 `code` 贴到 issue（见下） |
 | 左下角黄条：`分P数据 已暂停（之前被关闭过，不会显示）` | 你（或某次更新）把开关关掉了 | 点「重新启用」，**这一条最关键** |
 | 页面完全空白，连黄条都没有 | 脚本没跑起来 | 见下 |
@@ -255,9 +260,11 @@ SCENARIO=inlinescript node test/smoke.js    # 场景 6：数据只在内联 scri
 SCENARIO=domonly      node test/smoke.js    # 场景 7：只靠 DOM 的 data-cid 列表
 SCENARIO=paused       node test/smoke.js    # 场景 8：开关被关闭，必须弹「已暂停」通知
 SCENARIO=error        node test/smoke.js    # 场景 9：全部取不到，必须弹「未显示」+ 诊断信息
+SCENARIO=latehydrate  node test/smoke.js    # 场景 10：B 站在 document-idle 之后才异步水合
+SCENARIO=perfonly     node test/smoke.js    # 场景 11：只从播放器请求里抠 cid，按单分P降级
 ```
 
-九个场景全部通过（242 项断言），退出码 0，可以直接接 CI。
+十一个场景全部通过（273 项断言），退出码 0，可以直接接 CI。
 Windows cmd 下把 `SCENARIO=malformed` 换成 `set SCENARIO=malformed`。
 
 三条关键不变量：
