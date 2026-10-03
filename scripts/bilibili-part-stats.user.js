@@ -2,7 +2,7 @@
 // @name         Bilibili 分P数据补全
 // @name:en      Bilibili Part Stats
 // @namespace    https://github.com/kyo-zzz/bili-part-stats
-// @version      0.3.0
+// @version      0.3.1
 // @description  在 B 站视频标题下方补齐「每个分 P」的弹幕数与在线观看人数，补回官方改版后丢失的展示。
 // @description:en  Restores the per-part danmaku count and live viewer count below the video title on bilibili.com.
 // @author       kyo-zzz
@@ -600,19 +600,20 @@
 #b-ps-bar{
   --b-ps-accent:#00AEEC; --b-ps-text:#61666d; --b-ps-strong:#18191c;
   --b-ps-line:#e3e5e7; --b-ps-bg:#f6f7f8;
-  display:inline-block; width:22px; height:22px; line-height:22px;
-  margin:0 2px; padding:0; vertical-align:baseline;
+  display:inline-flex; align-items:center; justify-content:center;
+  width:22px; height:22px; padding:0; margin-left:auto;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",
               Arial,"PingFang SC","Microsoft YaHei",sans-serif;
   color:var(--b-ps-text);
   cursor:pointer;
+  flex-shrink:0;
 }
-/* 图标本身是「ⓘ」文字，用 text-indent 把它挪出可视区，只留一个小蓝点占位。
-   这样既保留可点区域，又不依赖字体渲染出图形，任何字体都能稳定显示。 */
+/* 图标本身是「ⓘ」文字，直接作为文本内容——用文字就能在任何字体下稳定显示。 */
 #b-ps-bar::before{
-  content:"i"; display:inline-block; width:22px; height:22px; border-radius:50%;
+  content:"i"; display:inline-flex; align-items:center; justify-content:center;
+  width:22px; height:22px; border-radius:50%;
   background:var(--b-ps-accent); color:#fff; font-size:13px; font-weight:700;
-  line-height:22px; text-align:center; font-style:normal;
+  line-height:1; text-align:center; font-style:normal;
 }
 #b-ps-bar:hover{ opacity:.85; }
 .b-ps-chip{
@@ -628,12 +629,17 @@
 .b-ps-btn:hover{ text-decoration:underline; }
 .b-ps-close{ cursor:pointer; color:#9499a0; font-size:15px; line-height:1; }
 .b-ps-close:hover{ color:var(--b-ps-strong); }
+/* 面板挂到 body 并用 fixed 定位：祖先的 overflow:hidden / max-height 无法裁剪它，
+   也不会被标题栏 / 统计行的布局挤到奇怪的位置。默认停在视口右下角，
+   像聊天框一样不打扰主内容。 */
 #b-ps-panel{
-  display:none; margin:2px 0 10px; border:1px solid var(--b-ps-line);
+  display:none; position:fixed; right:16px; bottom:16px; z-index:999999;
+  width:min(720px,92vw); max-height:80vh;
+  margin:0; border:1px solid var(--b-ps-line);
   border-radius:8px; background:#fff; overflow:hidden; font-size:12px;
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",
               Arial,"PingFang SC","Microsoft YaHei",sans-serif;
-  box-shadow:0 2px 12px rgba(0,0,0,.06);
+  box-shadow:0 6px 24px rgba(0,0,0,.12);
 }
 #b-ps-panel.is-open{ display:block; }
 .b-ps-head{
@@ -653,15 +659,22 @@
 .b-ps-row{ cursor:pointer; }
 .b-ps-row:hover td{ background:var(--b-ps-bg); }
 .b-ps-row.b-ps-cur td{ background:#e6f3fd; }
-/* 找不到标题锚点时的兜底停靠位置，保证脚本永远至少能被看见一次 */
+/* 找不到锚点时的兜底停靠位置：贴在视口左下角，绝不碰顶栏。
+   v0.3.1 起从 top:70px 改到 bottom:16px —— 之前顶栏在某些页面比 70px 高，
+   图标 / 通知条会盖住搜索框和头像那一排，用户以为「顶栏消失了」。 */
 #b-ps-bar.is-float{
-  position:fixed; left:12px; top:70px; z-index:999999; max-width:62vw;
+  position:fixed; left:12px; bottom:16px; z-index:999999; max-width:62vw;
 }
+/* 通知条同样钉在左下角，不再走文档流；否则会被追加到 body 末尾跑到页面底。 */
 #b-ps-bar.is-notice{
   display:flex; flex-wrap:wrap; align-items:center; gap:8px;
-  position:static; vertical-align:initial; cursor:default;
+  position:fixed; left:12px; bottom:16px; z-index:999999;
+  width:auto; max-width:calc(100vw - 24px);
+  height:auto; margin:0; padding:6px 12px; vertical-align:initial;
+  cursor:default; line-height:1.5;
   background:#fffbe6; border:1px solid #ffe58f; border-radius:6px;
-  padding:6px 10px; margin:6px 0 2px; font-size:12px; line-height:1.5;
+  font-size:12px;
+  box-shadow:0 4px 16px rgba(0,0,0,.12);
 }
 #b-ps-bar.is-notice::before{ content:none; }
 #b-ps-bar.is-notice .b-ps-btn{ display:inline-flex; }
@@ -677,11 +690,23 @@
   }
 
   /**
-   * 锚点：优先 B 站标题元素。
+   * 锚点：优先 B 站视频「标题下面的统计行」（播放量/发布日期那一栏）。
+   *
+   * v0.3.1 起改到统计行：标题过长时图标会跟「展开标题」按钮重合；
+   * 放到统计行末尾就干净了，也顺带避开顶栏。
    * 选择器列表刻意写宽 —— B 站改版频繁，宁可多试几种也不要静默不显示。
+   *
+   * 返回值保证是「能装下栏的容器」：叶节点（h1 / span / a）自动上跳到
+   * 父容器，避免 appendChild 把图标塞进 h1 把标题文本挤坏。
    */
   function findAnchor() {
     const sels = [
+      '.video-data',
+      '.video-title .video-data',
+      '.title-container .video-data',
+      '.info .video-data',
+      '.video-info-container',
+      '.info-container',
       'h1.video-title__text',
       'h1.video-title',
       '.video-title h1',
@@ -691,23 +716,25 @@
       'h1',
       '.title',
     ];
+    // 这些标签下不能塞 block 子元素，命中时自动上跳到父容器
+    const leafRe = /^(H[1-6]|SPAN|A|STRONG|EM|B|SMALL|TIME|S|U)$/;
     for (const s of sels) {
       const el = document.querySelector(s);
-      if (el && el.textContent.trim().length > 1) return el;
+      if (!el || el.textContent.trim().length < 2) continue;
+      return leafRe.test(el.tagName) ? (el.parentElement || el) : el;
     }
     return null;
   }
 
   /**
-   * 把栏和面板作为兄弟节点挂在标题容器之后。
-   * 栏和面板用两个独立容器 —— renderBar 清栏时不会连带清掉面板。
-   * 找不到标题锚点时退化为固定停靠（见 mountFloating），绝不静默消失。
+   * 把栏挂在锚点（视频统计行）内部末尾，作为一个 inline-flex 的小图标
+   * 排在最后；面板单独挂到 body，用 position:fixed 弹出，不受任何祖先
+   * overflow:hidden / max-height 裁剪。
+   * 找不到锚点时退化为固定停靠（见 mountFloating），绝不静默消失。
    */
   function mount() {
     const anchor = findAnchor();
     if (!anchor) return mountFloating();
-    const box = anchor.closest('.video-title') || anchor.parentElement;
-    if (!box) return mountFloating();
 
     let bar = document.getElementById(BAR_ID);
     if (!bar) {
@@ -716,14 +743,22 @@
     }
     bar.classList.remove('is-float', 'is-notice', 'is-bad');
     bar.style.cssText = '';
-    box.insertAdjacentElement('afterend', bar);
 
+    // 把栏追加进锚点末尾：inline-flex 元素在 flex / inline 容器里都排到末尾，
+    // 视觉上就是「播放量 · 日期 · 弹幕 · ……」的最后一格。
+    anchor.appendChild(bar);
+
+    // 面板挂到 body：祖先 overflow:hidden / max-height 无法裁剪它。
     let panel = document.getElementById(PANEL_ID);
     if (!panel) {
       panel = document.createElement('div');
       panel.id = PANEL_ID;
     }
-    if (panel.previousElementSibling !== bar) bar.insertAdjacentElement('afterend', panel);
+    const host = document.body || document.documentElement;
+    if (panel.parentElement !== host) {
+      if (panel.parentElement) panel.parentElement.removeChild(panel);
+      host.appendChild(panel);
+    }
     state.floating = false;
     return true;
   }

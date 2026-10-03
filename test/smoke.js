@@ -476,8 +476,10 @@ setTimeout(() => {
   const b = bar;
   const p = panel;
   assert('面板元素已创建', !!p);
-  assert('栏挂在标题容器之后', !!(titleBox._orphan || []).includes(b));
-  assert('面板紧挨在栏之后', !!(b._orphan || []).includes(p));
+  // v0.3.1 起：栏 appendChild 到锚点容器内部（h1 是叶节点，findAnchor 上跳到父容器 titleBox）
+  assert('栏挂在锚点容器内部（appendChild）', !!b && b.parentElement === titleBox);
+  // 面板挂到 body，避开任何祖先 overflow:hidden 裁剪
+  assert('面板挂到 body（position:fixed 不受祖先布局影响）', !!p && p.parentElement === documentStub.body);
   // v0.3 起：栏收缩成一个「小图标」——自身不再有任何文本内容，
   // 点它靠 wire() 的 click 委托识别（e.target.closest('#b-ps-bar')）。
   assert('栏本身是空的（图标由 CSS ::before 画出来）', !b.innerHTML || b.innerHTML.length === 0);
