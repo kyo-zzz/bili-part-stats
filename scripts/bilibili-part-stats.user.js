@@ -2,7 +2,7 @@
 // @name         Bilibili 分P数据补全
 // @name:en      Bilibili Part Stats
 // @namespace    https://github.com/kyo-zzz/bili-part-stats
-// @version      0.2.0
+// @version      0.2.1
 // @description  在 B 站视频标题下方补齐「每个分 P」的弹幕数与在线观看人数，补回官方改版后丢失的展示。
 // @description:en  Restores the per-part danmaku count and live viewer count below the video title on bilibili.com.
 // @author       kyo-zzz
@@ -176,18 +176,80 @@
     return m ? m[1].toUpperCase() : null;
   }
 
-  /** 第一优先：直接读页面已加载的初始状态，不发任何请求 */
+  /* ----------------------------- 页面数据 ----------------------------- */
+
+  // B 站业务错误码里少数几个值得让用户看懂的
+  const CODE_HINT = {
+    '-101': '账号不存在',
+    '-111': '登录状态异常',
+    '-214': '账号被封禁',
+    '-352': '触发风控',
+    '-403': '无权限',
+    '-404': '请求被拒或视频不可见',
+    '-412': '需要登录',
+    '-429': '请求过于频繁',
+  };
+
+  /**
+   * 在 __INITIAL_STATE__ 里找分P列表：找到第一个「pages 是数组且每项带 cid」的对象。
+   *
+   * B 站这个状态的结构一直在变，不能钉死在某条 key 路径上——videoData 有时是对象、
+   * 有时是被 JSON.stringify 过的字符串，外面还可能再裹一层 data。
+   * 有界深度扫描（最多 5 层）兜住所有变体，解析失败静默跳过。
+   */
+  function scanForVideo(node, depth) {
+    if (!node || depth > 5) return null;
+    if (typeof node === 'string') {
+      if (node.length > 500000) return null;
+      try { return scanForVideo(JSON.parse(node), depth); } catch (_) { return null; }
+    }
+    if (typeof node !== 'object') return null;
+    if (Array.isArray(node.pages) && node.pages.length &&
+        node.pages[0] && node.pages[0].cid !== undefined) return node;
+    let keys;
+    try { keys = Object.keys(node); } catch (_) { return null; }
+    for (let i = 0; i < keys.length; i++) {
+      const hit = scanForVideo(node[keys[i]], depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  }
+
+  /**
+   * 第一优先：直接读页面已加载的初始状态，不发任何请求。
+   *
+   * 这条路径是整个脚本的地基——它命中就不需要任何网络请求，
+   * 也就不受登录态、风控、CORS 的影响。syncCurrent 每秒都会调它，
+   * 所以结果按状态对象做记忆化，不能每次都全量扫描。
+   */
   function readInitialState() {
-    const st = window.__INITIAL_STATE__;
-    if (!st) return null;
-    const data = (st.videoData && st.videoData.data) || st.data || null;
-    return data && Array.isArray(data.pages) ? data : null;
+    try {
+      const st = window.__INITIAL_STATE__;
+      if (st && typeof st === 'object') {
+        if (st.__bPsVideoMemo) return st.__bPsVideoMemo;
+        const hit = scanForVideo(st, 0);
+        if (hit) {
+          try { st.__bPsVideoMemo = hit; } catch (_) {}
+          return hit;
+        }
+      }
+    } catch (_) {}
+    const script = document.querySelector('script#__INITIAL_STATE__');
+    if (script && script.textContent) {
+      try {
+        const hit = scanForVideo(JSON.parse(script.textContent), 0);
+        if (hit) return hit;
+      } catch (_) {}
+    }
+    return null;
   }
 
   async function fetchView(bvid) {
     const j = await fetchJSON(API + '/x/web-interface/view?bvid=' + encodeURIComponent(bvid));
     if (!j || j.code !== 0 || !j.data || !Array.isArray(j.data.pages)) {
-      throw new Error('view 接口异常 code=' + (j && j.code));
+      const code = j && j.code;
+      const hint = CODE_HINT[String(code)];
+      throw new Error('view 接口异常 code=' + code + (hint ? '（' + hint + '）' : ''));
     }
     return j.data;
   }

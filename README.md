@@ -4,7 +4,7 @@
 > 单文件 Tampermonkey 脚本，零依赖、零构建，复制到浏览器即用。
 
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![version](https://img.shields.io/badge/version-0.2.0-green.svg)](./scripts/bilibili-part-stats.user.js)
+[![version](https://img.shields.io/badge/version-0.2.1-green.svg)](./scripts/bilibili-part-stats.user.js)
 [![tampermonkey](https://img.shields.io/badge/Tampermonkey-userscript-orange.svg)](https://www.tampermonkey.net/)
 
 ---
@@ -148,7 +148,7 @@ git push -u origin main
 | 你看到的 | 含义 | 怎么办 |
 |---|---|---|
 | 标题下方正常一行 | 一切正常 | —— |
-| 左下角黄条：`分P数据 未显示 · 取不到视频数据（…）` | 接口取数失败（CORS / 风控 / 登录态） | 点「重试」；仍失败说明你的网络或账号被风控 |
+| 左下角黄条：`分P数据 未显示 · 取不到视频数据（…）` | 页面自己的初始状态里取不到分P列表，回退到接口也被拒 | 点「重试」；仍失败把括号里的 `code` 贴到 issue（见下） |
 | 左下角黄条：`分P数据 已暂停（之前被关闭过，不会显示）` | 你（或某次更新）把开关关掉了 | 点「重新启用」，**这一条最关键** |
 | 页面完全空白，连黄条都没有 | 脚本没跑起来 | 见下 |
 
@@ -164,6 +164,19 @@ git push -u origin main
    有日志说明脚本跑起来了；有红色报错就把报错内容贴到 issue。
 4. 页面里直接执行 `!!document.getElementById('b-ps-bar')`，返回 `true` 说明元素在 DOM 里，
    是样式问题；`false` 说明脚本根本没插入。
+
+**关于 `view 接口异常 code=-404`**：脚本的首选数据源是页面自己已经加载的
+`window.__INITIAL_STATE__`（零网络请求，不受登录态 / 风控 / CORS 影响），
+接口只是兜底。0.2.0 之前这段代码只认 `__INITIAL_STATE__.videoData.data` 这一条固定路径，
+而 B 站实际会把 `videoData` 序列化成 JSON 字符串，于是永远匹配不上、每次都落回网络请求，
+进而吃下 `-404`。0.2.1 改成了有界深度扫描 + 字符串解包，能命中所有已知形态。
+**如果你仍看到这条报错，说明你遇到的又是一种新形态**，请在 Console 执行下面这段并把输出贴到 issue：
+
+```js
+(() => { const s = window.__INITIAL_STATE__;
+  console.log(typeof s, s && Object.keys(s).slice(0, 40));
+  console.log(s && s.videoData && typeof s.videoData); })();
+```
 
 ## 配置项
 
@@ -229,17 +242,24 @@ git push -u origin main
 初始化时序和降级路径这类只在运行时暴露的错误：
 
 ```bash
-node test/smoke.js                       # 场景 1：正常响应，分段遍历收敛
-SCENARIO=malformed node test/smoke.js    # 场景 2：接口返回缺 code 字段，必须降级为 —
-SCENARIO=paused    node test/smoke.js    # 场景 3：开关被关闭，必须弹「已暂停」通知
-SCENARIO=error     node test/smoke.js    # 场景 4：视频数据全取不到，必须弹「未显示」通知
+node test/smoke.js                          # 场景 1：正常响应，分段遍历收敛
+SCENARIO=malformed   node test/smoke.js     # 场景 2：接口返回缺 code 字段，必须降级为 —
+SCENARIO=nostate-flat  node test/smoke.js   # 场景 3：初始状态形状变体（平铺 data）
+SCENARIO=nostate-string node test/smoke.js  # 场景 4：videoData 是 JSON 字符串（线上真实形态）
+SCENARIO=nostate-deep  node test/smoke.js   # 场景 5：数据嵌套 3 层深
+SCENARIO=paused      node test/smoke.js     # 场景 6：开关被关闭，必须弹「已暂停」通知
+SCENARIO=error       node test/smoke.js     # 场景 7：视频数据全取不到，必须弹「未显示」通知
 ```
 
-四个场景全部通过（27 + 27 + 20 + 19 = 93 项断言），退出码 0，可以直接接 CI。
+七个场景全部通过（28×5 + 21 + 19 = 180 项断言），退出码 0，可以直接接 CI。
 Windows cmd 下把 `SCENARIO=malformed` 换成 `set SCENARIO=malformed`。
 
-场景 3 / 4 是 0.2.0 加的核心回归：**失败路径绝不能静默**。这两条路径在 0.1.x 是静默
-`hideAll()`，用户只会看到空白页，无从判断脚本到底有没有跑起来。
+三条关键不变量：
+
+1. **失败必须可见** —— 场景 6 / 7 盯 0.1.x 的静默 `hideAll()`，用户只会看到空白页。
+2. **零网络依赖** —— 页面 `__INITIAL_STATE__` 里已经有数据时不该发任何 view 请求。
+   当初就是这条没守住，脚本落回网络请求才吃下 `code=-404`。
+3. **形状不敏感** —— 场景 3 / 4 / 5 覆盖 B 站初始状态的已知变体。
 
 注意：这个测试只覆盖启动与渲染路径，**不覆盖真实浏览器行为**
 （CSS 选择器是否命中 B 站真实 DOM、`fetch` 跨域与 cookie、SPA 路由切换）。

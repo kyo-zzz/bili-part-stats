@@ -7,15 +7,21 @@
  * 运行：
  *   node test/smoke.js                       # 场景 1：正常响应，分段遍历收敛
  *   SCENARIO=malformed node test/smoke.js    # 场景 2：接口返回缺 code 字段，必须降级为 —
- *   SCENARIO=paused    node test/smoke.js    # 场景 3：enabled=false，必须弹「已暂停」通知
- *   SCENARIO=error     node test/smoke.js    # 场景 4：视频数据全取不到，必须弹「未显示」通知
+ *   SCENARIO=nostate-flat  node test/smoke.js# 场景 3：__INITIAL_STATE__ 形状变体（平铺 data）
+ *   SCENARIO=nostate-string node test/smoke.js#场景 4：videoData 是 JSON 字符串（线上真实形态）
+ *   SCENARIO=nostate-deep  node test/smoke.js# 场景 5：数据嵌套 3 层深
+ *   SCENARIO=paused    node test/smoke.js    # 场景 6：enabled=false，必须弹「已暂停」通知
+ *   SCENARIO=error     node test/smoke.js    # 场景 7：视频数据全取不到，必须弹「未显示」通知
  *
- * 通过时四个场景全部通过，进程退出码 0；任一失败退出码 1，可直接接 CI。
+ * 全部通过时进程退出码 0；任一失败退出码 1，可直接接 CI。
  * Windows cmd 下用 set SCENARIO=malformed 代替前缀赋值。
  *
  * 断言分三段：启动与初始渲染 → 模拟点击（面板展开 / 收起）→ countAll 收敛。
- * paused / error 两个场景的断言核心是「失败必须可见」：这两条路径以前是静默
- * hideAll()，用户只会看到空白页，无从判断脚本到底有没有跑起来。
+ * 三条关键不变量：
+ *   1. 失败必须可见 —— paused / error 两条路径以前是静默 hideAll()，用户只看到空白页。
+ *   2. 零网络依赖 —— 页面 __INITIAL_STATE__ 里已经有数据时不该发任何 view 请求。
+ *      当初就是这条没守住，脚本落回网络请求才吃下 code=-404。
+ *   3. 形状不敏感 —— nostate-* 三个场景覆盖 B 站初始状态的已知变体。
  */
 const fs = require('fs');
 const path = require('path');
@@ -28,7 +34,9 @@ const src = fs.readFileSync(SCRIPT, 'utf8');
 // SCENARIO=paused      enabled=false（曾点过关闭）：必须弹「已暂停」通知，绝不能静默消失
 // SCENARIO=error       页面数据 + view 接口全取不到：必须弹「未显示」通知，绝不能静默消失
 const SCENARIO = process.env.SCENARIO || 'normal';
-const EXPECT_SEG = SCENARIO === 'malformed' ? 1 : SCENARIO === 'normal' ? 7 : 0;
+// 只有 error 场景完全没有分P数据、不可能发起分段请求；
+// nostate-* 场景数据来自页面状态，弹幕数仍要真正调 seg.so，所以期望值和 normal 一致
+const EXPECT_SEG = SCENARIO === 'malformed' ? 1 : SCENARIO === 'error' ? 0 : 7;
 
 /* ---------------- 最小 DOM ---------------- */
 const registry = new Map();
@@ -137,6 +145,7 @@ const PAGE = {
 
 let segCalls = 0;
 let viewerCalls = 0;
+let viewCalls = 0;
 
 const locationStub = {
   pathname: '/video/BV1Rxam6kEtU/',
@@ -149,10 +158,30 @@ function htmlErr() {
   return { ok: true, status: 200, json: async () => { throw new Error('Unexpected token < in JSON'); } };
 }
 
-// seg.so：每段返回 5 条弹幕，进度 +30s，总时长 204s → 7 次调用后收敛
+// __INITIAL_STATE__ 的形状回归矩阵：B 站一直在改结构，
+// readInitialState 不能钉死在某条 key 路径上，否则会误落回网络请求（进而吃风控/-404）。
+//   normal / malformed : { videoData: { data: PAGE } }
+//   nostate-flat       : { data: PAGE }
+//   nostate-string     : { videoData: '<JSON 字符串>' }   ← 线上真实踩到的形态
+//   nostate-deep       : { a: { b: { c: { data: PAGE } } } }
+function buildInitialState() {
+  switch (SCENARIO) {
+    case 'nostate-flat': return { data: PAGE };
+    case 'nostate-string': return { videoData: JSON.stringify({ code: 0, data: PAGE }) };
+    case 'nostate-deep': return { a: { b: { c: { data: PAGE } } } };
+    default: return { videoData: { data: PAGE } };
+  }
+}
+
+// 顺序敏感：'/x/web-interface/view/type' 也包含 '/x/web-interface/view'，必须先判前者
 const fetchImpl = async (url) => {
   const u = String(url);
+  if (u.includes('/x/web-interface/view/type')) {
+    viewerCalls++;
+    return htmlErr(); // 端点已下线的真实形态：回 HTML 而不是 JSON
+  }
   if (u.includes('/x/web-interface/view?')) {
+    viewCalls++;
     if (SCENARIO === 'error') throw new Error('TypeError: Failed to fetch (CORS)');
     return ok({ code: 0, data: JSON.parse(JSON.stringify(PAGE)) });
   }
@@ -170,10 +199,6 @@ const fetchImpl = async (url) => {
     // malformed 场景：故意不给 code 字段，模拟响应结构被 B 站改掉
     return ok(SCENARIO === 'malformed' ? body : Object.assign({ code: 0 }, body));
   }
-  if (u.includes('/x/web-interface/view/type')) {
-    viewerCalls++;
-    return htmlErr(); // 端点已下线的真实形态：回 HTML 而不是 JSON
-  }
   throw new Error('unexpected url: ' + u);
 };
 
@@ -186,7 +211,7 @@ const windowStub = {
   addEventListener() {},
   dispatchEvent() {},
   // error 场景：页面首屏数据也缺失，逼脚本去问接口，从而触发 loadVideo 抛错
-  __INITIAL_STATE__: SCENARIO === 'error' ? undefined : { videoData: { data: PAGE } },
+  __INITIAL_STATE__: SCENARIO === 'error' ? undefined : buildInitialState(),
 };
 
 const bootError = [];
@@ -281,6 +306,12 @@ setTimeout(() => {
   assert('栏元素已创建（任何场景都不能没有栏）', !!bar);
   assert('注册了 3 个油猴菜单项', menu.length === 3);
   assert('注册了 1 个 click 委托处理器', (handlers.click || []).length === 1);
+
+  // v0.2.1 的核心不变量：页面自己已经有分P数据时，脚本不该打任何 view 请求。
+  // 当初就是这条没守住，才落回网络请求吃下 code=-404。
+  if (SCENARIO !== 'error') {
+    assert('已能从 __INITIAL_STATE__ 直接取到分P数据，零 view 请求（' + SCENARIO + '）', viewCalls === 0);
+  }
 
   if (isNotice) {
     // v0.2 最关键的两条回归：这两条失败路径以前是静默 hideAll()，
