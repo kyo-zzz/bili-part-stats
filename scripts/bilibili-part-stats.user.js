@@ -2,7 +2,7 @@
 // @name         Bilibili 分P数据补全
 // @name:en      Bilibili Part Stats
 // @namespace    https://github.com/kyo-zzz/bili-part-stats
-// @version      0.2.1
+// @version      0.2.2
 // @description  在 B 站视频标题下方补齐「每个分 P」的弹幕数与在线观看人数，补回官方改版后丢失的展示。
 // @description:en  Restores the per-part danmaku count and live viewer count below the video title on bilibili.com.
 // @author       kyo-zzz
@@ -216,32 +216,154 @@
   }
 
   /**
+   * 遍历所有可能藏着分P列表的来源。命中就把结果记在源对象上（B 站替换掉
+   * 整个状态对象时记忆自动失效），未命中则 5 秒内不重复扫。
+   */
+  const STATE_KEYS = [
+    '__INITIAL_STATE__', 'videoData', '__NEXT_DATA__', '__NUXT__',
+    '__INITIAL_DATA__', '__state__',
+  ];
+
+  function collectStateRoots() {
+    const roots = [];
+    for (let i = 0; i < STATE_KEYS.length; i++) {
+      let v = null;
+      try { v = window[STATE_KEYS[i]]; } catch (_) {}
+      if (v) roots.push(v);
+    }
+    // B 站有时不给 script 加 id，而是直接 window.__INITIAL_STATE__ = {...}
+    let scripts = [];
+    try { scripts = Array.prototype.slice.call(document.querySelectorAll('script')); } catch (_) {}
+    for (let i = 0; i < scripts.length; i++) {
+      const s = scripts[i];
+      const t = s && s.textContent;
+      if (typeof t !== 'string' || t.length < 40 || t.length > 3000000) continue;
+      if (t.indexOf('__INITIAL_STATE__') < 0 && t.indexOf('videoData') < 0) continue;
+      let raw = null;
+      const m = t.match(/__INITIAL_STATE__\s*[:=]\s*([\s\S]+)/);
+      if (m) { try { raw = JSON.parse(m[1].replace(/[;,]\s*$/, '')); } catch (_) {} }
+      if (!raw) { try { raw = JSON.parse(t); } catch (_) {} }
+      if (raw) roots.push(raw);
+    }
+    return roots;
+  }
+
+  /**
    * 第一优先：直接读页面已加载的初始状态，不发任何请求。
    *
-   * 这条路径是整个脚本的地基——它命中就不需要任何网络请求，
-   * 也就不受登录态、风控、CORS 的影响。syncCurrent 每秒都会调它，
-   * 所以结果按状态对象做记忆化，不能每次都全量扫描。
+   * 这条路径是整个脚本的地基——命中它就不需要任何网络请求，
+   * 也就不受登录态、风控、CORS 的影响。
    */
+  let stateNegUntil = 0;
+
   function readInitialState() {
-    try {
-      const st = window.__INITIAL_STATE__;
-      if (st && typeof st === 'object') {
-        if (st.__bPsVideoMemo) return st.__bPsVideoMemo;
-        const hit = scanForVideo(st, 0);
-        if (hit) {
-          try { st.__bPsVideoMemo = hit; } catch (_) {}
-          return hit;
-        }
+    if (Date.now() < stateNegUntil) return null;
+    let roots = [];
+    try { roots = collectStateRoots(); } catch (_) { return null; }
+    for (let i = 0; i < roots.length; i++) {
+      let r = roots[i];
+      if (typeof r === 'string') { try { r = JSON.parse(r); } catch (_) { continue; } }
+      if (!r || typeof r !== 'object') continue;
+      if (r.__bPsVideoMemo) return r.__bPsVideoMemo;
+      const hit = scanForVideo(r, 0);
+      if (hit) {
+        try { r.__bPsVideoMemo = hit; } catch (_) {}
+        return hit;
       }
-    } catch (_) {}
-    const script = document.querySelector('script#__INITIAL_STATE__');
-    if (script && script.textContent) {
-      try {
-        const hit = scanForVideo(JSON.parse(script.textContent), 0);
-        if (hit) return hit;
-      } catch (_) {}
     }
+    stateNegUntil = Date.now() + 5000;
     return null;
+  }
+
+  /* ------------------- 兜底源：直接从 DOM 分P选择器抓 ------------------- */
+
+  const DUR_RE = /\b(\d{1,2}:\d{2}(?::\d{2})?)\b/;
+  const DM_TOTAL_RE = /^弹幕\s*([\d.]+)\s*(万|w)?$/i;
+
+  function documentTitle() {
+    try { return String(document.title || '').replace(/[_-]哔哩哔哩.*$/, '').trim(); }
+    catch (_) { return ''; }
+  }
+
+  /** 页面统计行里的「弹幕 N」，取不到返回 0 */
+  function readTotalDanmaku() {
+    let nodes = [];
+    try { nodes = Array.prototype.slice.call(document.querySelectorAll('span,div,a')).slice(0, 800); }
+    catch (_) { return 0; }
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      let t = '';
+      try { t = (el.textContent || '').replace(/\s+/g, '').trim(); } catch (_) { continue; }
+      if (!t || t.length > 20) continue;
+      const m = t.match(DM_TOTAL_RE);
+      if (m) {
+        let n = Number(m[1]);
+        if (m[2]) n *= 10000;
+        return Math.floor(n);
+      }
+    }
+    return 0;
+  }
+
+  /**
+   * 第三优先：直接从 DOM 里的分P选择器抓列表。
+   *
+   * 完全不依赖 __INITIAL_STATE__ 的形状——只要页面上渲染出了分P标签就能用。
+   * 认 data-cid（B 站 SPA 跳转靠它），再用 data-p 或出现顺序补编号。
+   */
+  function collectFromDom(bvid) {
+    let nodes = [];
+    try { nodes = Array.prototype.slice.call(document.querySelectorAll('[data-cid]')); }
+    catch (_) { return null; }
+    const seen = {};
+    const order = [];
+    for (let i = 0; i < nodes.length; i++) {
+      const el = nodes[i];
+      const cid = String(el.getAttribute('data-cid') || '').trim();
+      if (!/^\d+$/.test(cid) || seen[cid]) continue;
+      seen[cid] = true;
+      order.push({ el: el, cid: cid, p: Number(el.getAttribute('data-p') || 0) || 0 });
+    }
+    if (!order.length) return null;
+    order.forEach(function (x, i) { if (!x.p) x.p = i + 1; });
+    order.sort(function (a, b) { return a.p - b.p; });
+    const pages = order.map(function (x) {
+      let text = '';
+      try { text = (x.el.textContent || '').replace(/\s+/g, ' ').trim(); } catch (_) {}
+      let duration = 0;
+      const dm = text.match(DUR_RE);
+      if (dm) {
+        const s = dm[1].split(':');
+        duration = (Number(s[0]) || 0) * 60 + (Number(s[1]) || 0);
+        text = text.replace(dm[1], '').replace(/\s+/g, ' ').trim();
+      }
+      return { cid: x.cid, page: x.p, part: text, duration: duration };
+    });
+    return { bvid: bvid, title: documentTitle(), pages: pages, totalDanmaku: readTotalDanmaku() };
+  }
+
+  /** 一页文字就够用的诊断串：下次反馈能直接定位，不用再来回猜 */
+  function diagnose() {
+    const p = [];
+    let st = null;
+    try { st = window.__INITIAL_STATE__; } catch (_) {}
+    let keys = '';
+    if (st && typeof st === 'object') {
+      try { keys = (Object.keys(st) || []).slice(0, 24).join(','); } catch (_) {}
+      p.push('__INITIAL_STATE__=obj[' + keys + ']');
+    } else {
+      p.push('__INITIAL_STATE__=' + (st === null ? 'null' : typeof st === 'undefined' ? 'undefined' : typeof st));
+    }
+    let ns = 0, nid = 0, ncid = 0;
+    try { ns = document.querySelectorAll('script').length; } catch (_) {}
+    try { nid = document.querySelectorAll('script#__INITIAL_STATE__').length; } catch (_) {}
+    try { ncid = document.querySelectorAll('[data-cid]').length; } catch (_) {}
+    p.push('script标签' + ns + '(带INITIAL_STATE__的id=' + nid + ')');
+    p.push('[data-cid]元素' + ncid);
+    p.push('bvid=' + (currentBvid() || '(未取到)'));
+    const t = documentTitle();
+    p.push('title=' + (t ? t.slice(0, 24) : '(空)'));
+    return p.join(' · ');
   }
 
   async function fetchView(bvid) {
@@ -254,20 +376,42 @@
     return j.data;
   }
 
+  /** 取视频信息的三级来源：页面状态 → DOM 分P列表 → view 接口 */
   async function loadVideo(bvid) {
     let data = readInitialState();
-    if (!data) data = await fetchView(bvid);
+    if (data) {
+      return {
+        bvid: bvid,
+        title: String(data.title || ''),
+        pages: normalizePages(data.pages),
+        totalDanmaku: (data.stat && data.stat.danmaku) | 0,
+      };
+    }
+    const fromDom = collectFromDom(bvid);
+    if (fromDom && fromDom.pages.length) return fromDom;
+
+    try {
+      data = await fetchView(bvid);
+    } catch (err) {
+      // 两条本地来源都失败了，把现场信息带上，用户贴一次就能定位
+      if (err && typeof err.message === 'string') err.message += ' ｜ 诊断: ' + diagnose();
+      throw err;
+    }
     return {
-      bvid,
+      bvid: bvid,
       title: String(data.title || ''),
-      pages: (data.pages || []).map((p, i) => ({
-        page: Number(p.page) || i + 1,
-        cid: String(p.cid),
-        part: String(p.part || ''),
-        duration: Number(p.duration) || 0,
-      })),
+      pages: normalizePages(data.pages),
       totalDanmaku: (data.stat && data.stat.danmaku) | 0,
     };
+  }
+
+  function normalizePages(pages) {
+    return (pages || []).map((p, i) => ({
+      page: Number(p.page) || i + 1,
+      cid: String(p.cid),
+      part: String(p.part || ''),
+      duration: Number(p.duration) || 0,
+    }));
   }
 
   /**
@@ -513,6 +657,14 @@
    * 任何失败都要给出可见的原因，绝不 hideAll 后让用户对着空白页猜。
    * 这是 v0.2 最关键的一条改动。
    */
+  /** 把 reason 里的「｜ 诊断: …」尾巴单独渲染成灰色小字 + 一键复制 */
+  function splitDiag(reason) {
+    const s = String(reason);
+    const i = s.indexOf('｜ 诊断:');
+    if (i < 0) return { head: s.trim(), diag: '' };
+    return { head: s.slice(0, i).trim(), diag: s.slice(i + '｜ 诊断:'.length).trim() };
+  }
+
   function showError(reason) {
     injectCss();
     hideAll();
@@ -521,11 +673,47 @@
     if (!bar) return;
     bar.classList.remove('is-notice', 'is-bad');
     bar.classList.add('is-notice', 'is-bad');
+    const parts = splitDiag(reason);
+    lastDiag = parts.diag;
     bar.innerHTML =
       '<b>分P数据</b> <span style="color:#cf1322">未显示</span> · ' +
-        escapeHtml(reason) +
+        escapeHtml(parts.head) +
         ' <span class="b-ps-btn" data-act="refresh" style="margin-left:6px">重试</span>' +
-        '<span class="b-ps-btn" data-act="dismiss" style="margin-left:4px">忽略</span>';
+        '<span class="b-ps-btn" data-act="dismiss" style="margin-left:4px">忽略</span>' +
+        (parts.diag
+          ? '<div style="margin-top:5px;padding-top:5px;border-top:1px dashed #ffd7d5;' +
+            'color:#8c8c8c;font-size:11px;line-height:1.6;word-break:break-all">' +
+            '诊断信息（贴到 GitHub issue 可快速定位）：<br>' + escapeHtml(parts.diag) +
+            ' <span class="b-ps-btn" data-act="copydiag" style="margin-left:4px">复制</span>' +
+            '</div>'
+          : '');
+  }
+
+  /** 诊断串一键复制，省得用户自己抠 F12 */
+  function copyText(text) {
+    if (!text) return;
+    const done = function () {
+      console.log('[bilibili-part-stats] 诊断信息已复制到剪贴板');
+    };
+    const fallback = function () {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        (document.body || document.documentElement).appendChild(ta);
+        ta.select();
+        const ok = document.execCommand && document.execCommand('copy');
+        ta.remove();
+        if (ok) done();
+      } catch (_) {}
+    };
+    if (typeof navigator !== 'undefined' && navigator.clipboard &&
+        navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, fallback);
+      return;
+    }
+    fallback();
   }
 
   /**
@@ -584,7 +772,8 @@
     panel.innerHTML =
       '<div class="b-ps-head">' +
         '<h3>' + escapeHtml(trunc(v.title, 30)) + '</h3>' +
-        '<span class="b-ps-meta">全片总弹幕 <b>' + fmt(v.totalDanmaku) + '</b></span>' +
+        '<span class="b-ps-meta">全片总弹幕 <b>' +
+          (v.totalDanmaku ? fmt(v.totalDanmaku) : '<span class="b-ps-dash">—</span>') + '</b></span>' +
         '<span class="b-ps-close" data-act="toggle" style="margin-left:auto" title="收起">×</span>' +
       '</div>' +
       '<div class="b-ps-scroll"><table class="b-ps-table">' +
@@ -618,7 +807,7 @@
     sec = Math.floor(Number(sec) || 0);
     const m = Math.floor(sec / 60);
     const s = sec % 60;
-    return m + ':' + String(s).padStart(2, '0');
+    return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
   }
 
   function togglePanel(force) {
@@ -662,6 +851,7 @@
         } else if (act === 'refresh') void rebuild();
         else if (act === 'dismiss') hideAll();
         else if (act === 'quiet') { pausedQuiet = true; noticeUntil = 0; hideAll(); }
+        else if (act === 'copydiag') copyText(lastDiag);
         else if (act === 'enable') {
           pausedQuiet = false; noticeUntil = 0;
           const c = cfg();
@@ -775,6 +965,8 @@
   let noticeUntil = 0;
   // 点过「忽略」后本页面会话内不再重复弹「已暂停」提示（enabled 仍为 false，只是不再打扰）
   let pausedQuiet = false;
+  // 最近一次失败时的诊断串，供「复制」按钮用
+  let lastDiag = '';
 
   async function rebuild() {
     if (!cfg().enabled) {

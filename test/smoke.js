@@ -6,22 +6,25 @@
  *
  * 运行：
  *   node test/smoke.js                       # 场景 1：正常响应，分段遍历收敛
- *   SCENARIO=malformed node test/smoke.js    # 场景 2：接口返回缺 code 字段，必须降级为 —
- *   SCENARIO=nostate-flat  node test/smoke.js# 场景 3：__INITIAL_STATE__ 形状变体（平铺 data）
+ *   SCENARIO=malformed   node test/smoke.js  # 场景 2：接口返回缺 code 字段，必须降级为 —
+ *   SCENARIO=nostate-flat  node test/smoke.js# 场景 3：初始状态形状变体（平铺 data）
  *   SCENARIO=nostate-string node test/smoke.js#场景 4：videoData 是 JSON 字符串（线上真实形态）
  *   SCENARIO=nostate-deep  node test/smoke.js# 场景 5：数据嵌套 3 层深
- *   SCENARIO=paused    node test/smoke.js    # 场景 6：enabled=false，必须弹「已暂停」通知
- *   SCENARIO=error     node test/smoke.js    # 场景 7：视频数据全取不到，必须弹「未显示」通知
+ *   SCENARIO=inlinescript node test/smoke.js # 场景 6：数据只在内联 script 里，window 上没有
+ *   SCENARIO=domonly      node test/smoke.js # 场景 7：只靠 DOM 的 data-cid 列表
+ *   SCENARIO=paused       node test/smoke.js # 场景 8：enabled=false，必须弹「已暂停」通知
+ *   SCENARIO=error        node test/smoke.js # 场景 9：全取不到，必须弹「未显示」+ 诊断信息
  *
- * 全部通过时进程退出码 0；任一失败退出码 1，可直接接 CI。
+ * 全部通过时进程退出码 0；任一失败退出码 1，可直接接 CI。共 242 项断言。
  * Windows cmd 下用 set SCENARIO=malformed 代替前缀赋值。
  *
  * 断言分三段：启动与初始渲染 → 模拟点击（面板展开 / 收起）→ countAll 收敛。
  * 三条关键不变量：
  *   1. 失败必须可见 —— paused / error 两条路径以前是静默 hideAll()，用户只看到空白页。
- *   2. 零网络依赖 —— 页面 __INITIAL_STATE__ 里已经有数据时不该发任何 view 请求。
+ *   2. 零网络依赖 —— 页面已经具备数据时不该发任何 view 请求。
  *      当初就是这条没守住，脚本落回网络请求才吃下 code=-404。
- *   3. 形状不敏感 —— nostate-* 三个场景覆盖 B 站初始状态的已知变体。
+ *   3. 来源不敏感 —— nostate-* / inlinescript / domonly 覆盖初始状态变体、
+ *      内联 script 注入、以及完全只靠 DOM 三种情况。
  */
 const fs = require('fs');
 const path = require('path');
@@ -41,12 +44,13 @@ const EXPECT_SEG = SCENARIO === 'malformed' ? 1 : SCENARIO === 'error' ? 0 : 7;
 /* ---------------- 最小 DOM ---------------- */
 const registry = new Map();
 
-function mkEl(tag) {
+function mkEl(tag, attrs) {
   const el = {
     tagName: (tag || 'div').toUpperCase(),
     children: [],
     parentElement: null,
     textContent: '',
+    attributes: attrs || {},
     style: {},
     classList: {
       _s: new Set(),
@@ -78,6 +82,7 @@ function mkEl(tag) {
   });
   el.querySelector = () => null;
   el.closest = () => null;
+  el.getAttribute = function (k) { return (k in this.attributes) ? this.attributes[k] : null; };
   el.appendChild = function (c) {
     this.children.push(c);
     c.parentElement = this;
@@ -113,12 +118,30 @@ const titleBox = mkEl('div');
 titleBox.appendChild(h1);
 h1.closest = () => titleBox;
 
+// domonly 场景用：页面上渲染出来的分P标签（B 站靠 data-cid 做 SPA 跳转）
+const domParts = [];
+if (SCENARIO === 'domonly') {
+  const p1 = mkEl('li', { 'data-cid': '42391374735', 'data-p': '1' });
+  p1.textContent = '【中】宣传PV  03:24';
+  const p2 = mkEl('li', { 'data-cid': '42391375292', 'data-p': '2' });
+  p2.textContent = '【日】宣传PV  03:24';
+  domParts.push(p1, p2);
+}
+// 页面统计行里的「弹幕 N」
+const statNode = mkEl('span');
+statNode.textContent = '弹幕 8040';
+
+// inlinescript 场景用：数据只存在于内联 script，window 全局上没有
+// （PAGE 在下面才定义，所以到那儿再填）
+const inlineScripts = [];
+
 const handlers = {}; // 收集 document.addEventListener 注册的事件处理器
 
 const documentStub = {
   head: mkEl('head'),
   body: mkEl('body'),
   documentElement: mkEl('html'),
+  title: '《明日方舟》SideStory「昨日海」活动宣传PV_哔哩哔哩_bilibili',
   getElementById(id) { return registry.get(id) || null; },
   createElement(tag) { return mkEl(tag); },
   querySelector(sel) {
@@ -127,7 +150,12 @@ const documentStub = {
     return null;
   },
   addEventListener(type, fn) { (handlers[type] = handlers[type] || []).push(fn); },
-  querySelectorAll() { return []; },
+  querySelectorAll(sel) {
+    if (sel === 'script') return inlineScripts;
+    if (sel === '[data-cid]') return domParts;
+    if (sel === 'span,div,a') return [statNode];
+    return [];
+  },
 };
 
 /* ---------------- 页面数据 ---------------- */
@@ -142,6 +170,13 @@ const PAGE = {
   ],
   stat: { danmaku: 8040 },
 };
+
+// inlinescript 场景：数据只在内联 <script> 里，window 全局上没有
+if (SCENARIO === 'inlinescript') {
+  const s = mkEl('script');
+  s.textContent = 'window.__INITIAL_STATE__=' + JSON.stringify({ videoData: { data: PAGE } });
+  inlineScripts.push(s);
+}
 
 let segCalls = 0;
 let viewerCalls = 0;
@@ -164,6 +199,8 @@ function htmlErr() {
 //   nostate-flat       : { data: PAGE }
 //   nostate-string     : { videoData: '<JSON 字符串>' }   ← 线上真实踩到的形态
 //   nostate-deep       : { a: { b: { c: { data: PAGE } } } }
+//   inlinescript       : window 上没有，数据只在内联 <script> 里
+//   domonly / error    : window 上没有，见下
 function buildInitialState() {
   switch (SCENARIO) {
     case 'nostate-flat': return { data: PAGE };
@@ -172,6 +209,9 @@ function buildInitialState() {
     default: return { videoData: { data: PAGE } };
   }
 }
+
+// 这两个场景 window 全局上就是没有初始状态，逼脚本走内联 script / DOM 兜底
+const NO_WINDOW_STATE = { error: 1, domonly: 1, inlinescript: 1 };
 
 // 顺序敏感：'/x/web-interface/view/type' 也包含 '/x/web-interface/view'，必须先判前者
 const fetchImpl = async (url) => {
@@ -210,8 +250,8 @@ const menu = [];
 const windowStub = {
   addEventListener() {},
   dispatchEvent() {},
-  // error 场景：页面首屏数据也缺失，逼脚本去问接口，从而触发 loadVideo 抛错
-  __INITIAL_STATE__: SCENARIO === 'error' ? undefined : buildInitialState(),
+  // NO_WINDOW_STATE 场景：window 全局上没有初始状态
+  __INITIAL_STATE__: NO_WINDOW_STATE[SCENARIO] ? undefined : buildInitialState(),
 };
 
 const bootError = [];
@@ -347,6 +387,11 @@ setTimeout(() => {
     assert('取数失败提示明确写出「未显示」', !!bar && bar.innerHTML.includes('未显示'));
     assert('取数失败提示写出了真实失败原因', !!bar && bar.innerHTML.includes('Failed to fetch'));
     assert('取数失败提示给出「重试」按钮', !!bar && bar.innerHTML.includes('data-act="refresh"'));
+    // 现场诊断必须一起给出来，用户贴一次就能定位，不用再来回猜
+    assert('通知附带现场诊断信息', !!bar && bar.innerHTML.includes('诊断信息'));
+    assert('诊断含 __INITIAL_STATE__ 现场值', !!bar && bar.innerHTML.includes('__INITIAL_STATE__'));
+    assert('诊断含 [data-cid] 元素计数', !!bar && bar.innerHTML.includes('[data-cid]'));
+    assert('通知给出「复制」按钮', !!bar && bar.innerHTML.includes('data-act="copydiag"'));
 
     // 重试链路：接口仍然失败时，通知必须继续可见，不能又变成空白
     clickAct('refresh');
@@ -395,6 +440,11 @@ setTimeout(() => {
   assert('面板渲染出 2 个分P的行', !!p && (p.innerHTML.match(/b-ps-row/g) || []).length === 2);
   assert('面板高亮当前分P', !!p && p.innerHTML.includes('b-ps-cur'));
   assert('面板显示全片总弹幕', !!p && p.innerHTML.includes('8040'));
+  if (SCENARIO === 'domonly') {
+    // DOM 兜底源必须把时长和标题都解析出来，不能只凑出几个 cid
+    assert('DOM 兜底源解析出分P时长 03:24', !!p && p.innerHTML.includes('03:24'));
+    assert('DOM 兜底源从统计行取到全片总弹幕 8040', !!p && p.innerHTML.includes('8040'));
+  }
 
   clickAct('toggle', true);
   assert('点面板内的「×」后已收起', !!p && !p.classList.contains('is-open'));

@@ -2,6 +2,38 @@
 
 本项目遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.2.2] - 2026-10-03
+
+### 修复
+
+- **又补两条本地数据源，`view` 接口退到第四级。** 0.2.1 的深扫上线后线上仍然报
+  `code=-404`，说明这个页面 `window.__INITIAL_STATE__` 上根本取不到分P列表。
+  与其继续猜 B 站的状态形状，不如再加几条完全独立的来源：
+
+  | 级别 | 来源 | 说明 |
+  |---|---|---|
+  | 1 | `window` 上的初始状态 | 候选键 `__INITIAL_STATE__` / `videoData` / `__NEXT_DATA__` / `__NUXT__` / `__INITIAL_DATA__` / `__state__` |
+  | 2 | 内联 `<script>` 标签 | B 站有时不给 window 挂全局变量，而是写 `window.__INITIAL_STATE__ = {...}` |
+  | 3 | DOM 分P选择器 | 认 `data-cid`（B 站 SPA 跳转靠它），再用 `data-p` 或出现顺序补编号，标题和时长从文本里解析 |
+  | 4 | `view` 接口 | 前三级全取不到才请求 |
+
+  前三级都是零网络请求。第 3 级意味着**只要页面上渲染出了分P标签就能用**，
+  跟 B 站的状态结构完全解耦。
+
+- **错误通知现在自带现场诊断 + 一键复制。** 通知栏第二行会给出
+  `__INITIAL_STATE__` 的类型与 key 列表、内联 script 数量、`[data-cid]` 元素数量、
+  bvid、标题，旁边带「复制」按钮（`navigator.clipboard`，降级到 `execCommand`）。
+  用户贴一次到 issue 就能定位新形态，不用再自己抠 F12。
+- `fmtDur` 分钟补零，`3:24` → `03:24`，与 B 站自身展示一致。
+- 全片总弹幕取不到时显示 `—` 而不是 `0`（DOM 来源取不到统计行时会走这条）。
+
+### 新增
+
+- 冒烟测试从 7 场景 180 项断言扩到 **9 场景 242 项断言**：
+  新增 `inlinescript`（数据只在内联 script 里）和 `domonly`（完全只靠 DOM），
+  并给 `error` 场景加断言验证诊断信息与「复制」按钮确实出现在通知里。
+- 测试桩补 `getAttribute`、`document.title`、`querySelectorAll` 选择器分发。
+
 ## [0.2.1] - 2026-10-03
 
 ### 修复
