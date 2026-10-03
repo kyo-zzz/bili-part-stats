@@ -7,11 +7,15 @@
  * 运行：
  *   node test/smoke.js                       # 场景 1：正常响应，分段遍历收敛
  *   SCENARIO=malformed node test/smoke.js    # 场景 2：接口返回缺 code 字段，必须降级为 —
+ *   SCENARIO=paused    node test/smoke.js    # 场景 3：enabled=false，必须弹「已暂停」通知
+ *   SCENARIO=error     node test/smoke.js    # 场景 4：视频数据全取不到，必须弹「未显示」通知
  *
- * 通过时两个场景都是 26/26，进程退出码 0；任一失败退出码 1，可直接接 CI。
+ * 通过时四个场景全部通过，进程退出码 0；任一失败退出码 1，可直接接 CI。
+ * Windows cmd 下用 set SCENARIO=malformed 代替前缀赋值。
  *
  * 断言分三段：启动与初始渲染 → 模拟点击（面板展开 / 收起）→ countAll 收敛。
- * Windows cmd 下用 set SCENARIO=malformed 代替前缀赋值。
+ * paused / error 两个场景的断言核心是「失败必须可见」：这两条路径以前是静默
+ * hideAll()，用户只会看到空白页，无从判断脚本到底有没有跑起来。
  */
 const fs = require('fs');
 const path = require('path');
@@ -21,8 +25,10 @@ const src = fs.readFileSync(SCRIPT, 'utf8');
 
 // SCENARIO=normal      正常响应：分段遍历收敛，弹幕数应为 35
 // SCENARIO=malformed   seg.so 返回缺 code 字段：必须降级为 —，绝不能误报成 0
+// SCENARIO=paused      enabled=false（曾点过关闭）：必须弹「已暂停」通知，绝不能静默消失
+// SCENARIO=error       页面数据 + view 接口全取不到：必须弹「未显示」通知，绝不能静默消失
 const SCENARIO = process.env.SCENARIO || 'normal';
-const EXPECT_SEG = SCENARIO === 'malformed' ? 1 : 7;
+const EXPECT_SEG = SCENARIO === 'malformed' ? 1 : SCENARIO === 'normal' ? 7 : 0;
 
 /* ---------------- 最小 DOM ---------------- */
 const registry = new Map();
@@ -36,8 +42,8 @@ function mkEl(tag) {
     style: {},
     classList: {
       _s: new Set(),
-      add(c) { this._s.add(c); },
-      remove(c) { this._s.delete(c); },
+      add(...cs) { cs.forEach((c) => this._s.add(c)); },
+      remove(...cs) { cs.forEach((c) => this._s.delete(c)); },
       toggle(c, f) {
         if (f === false) this._s.delete(c); else this._s.add(c);
         return this._s.has(c);
@@ -147,6 +153,7 @@ function htmlErr() {
 const fetchImpl = async (url) => {
   const u = String(url);
   if (u.includes('/x/web-interface/view?')) {
+    if (SCENARIO === 'error') throw new Error('TypeError: Failed to fetch (CORS)');
     return ok({ code: 0, data: JSON.parse(JSON.stringify(PAGE)) });
   }
   if (u.includes('/x/v2/dm/web/seg.so')) {
@@ -172,11 +179,14 @@ const fetchImpl = async (url) => {
 
 /* ---------------- 全局环境 ---------------- */
 const store = {};
+// paused 场景：模拟用户曾经点过「关闭」，enabled 被持久化成 false
+if (SCENARIO === 'paused') store['bPsStore.v1'] = JSON.stringify({ config: { enabled: false } });
 const menu = [];
 const windowStub = {
   addEventListener() {},
   dispatchEvent() {},
-  __INITIAL_STATE__: { videoData: { data: PAGE } },
+  // error 场景：页面首屏数据也缺失，逼脚本去问接口，从而触发 loadVideo 抛错
+  __INITIAL_STATE__: SCENARIO === 'error' ? undefined : { videoData: { data: PAGE } },
 };
 
 const bootError = [];
@@ -195,8 +205,10 @@ try {
     { pushState() {} },
     fetchImpl,
     { getItem: (k) => (k in store ? store[k] : null), setItem: (k, v) => { store[k] = String(v); } },
-    (k, d) => (k in store ? JSON.parse(store[k]) : d),
-    (k, v) => { store[k] = JSON.stringify(v); },
+    // 脚本自己负责 JSON 编解码，这里必须原样存取字符串，
+    // 否则 loadStore 里的 JSON.parse 会二次解析失败，导致 enabled 等配置全部读不到
+    (k, d) => (k in store ? store[k] : d),
+    (k, v) => { store[k] = String(v); },
     (label, cb) => { menu.push([label, cb]); },
     class { observe() {} disconnect() {} },
     class { constructor(t) { this.type = t; } },
@@ -214,6 +226,8 @@ try {
 /* ---------------- 断言 ---------------- */
 const checks = [];
 const assert = (name, cond) => checks.push([name, !!cond]);
+const clsOf = (el) => (el && el.classList && el.classList._s) ? Array.from(el.classList._s) : [];
+const hasCls = (el, c) => clsOf(el).indexOf(c) >= 0;
 
 /** 模拟点击栏或面板上的某个 data-act 控件 */
 function clickAct(act, inPanel) {
@@ -260,19 +274,72 @@ function finish(dmCell) {
 setTimeout(() => {
   const bar = registry.get('b-ps-bar');
   const panel = registry.get('b-ps-panel');
+  const isNotice = SCENARIO === 'paused' || SCENARIO === 'error';
 
   assert('脚本注册了单例标记（防双跑）', windowStub.__biliPartStatsInstalled === true);
   assert('CSS 已注入 <style id=b-ps-css>', !!registry.get('b-ps-css'));
-  assert('栏元素已创建', !!bar);
-  assert('面板元素已创建', !!panel);
-  assert('栏挂在标题容器之后', !!(titleBox._orphan || []).includes(bar));
-  assert('面板紧挨在栏之后', !!(bar && bar._orphan || []).includes(panel));
-  assert('栏有内容', !!(bar && bar.innerHTML.length > 40));
-  assert('栏显示当前分P = P2（来自 ?p=2）', !!(bar && /P2/.test(bar.innerHTML)));
-  assert('当前分P标题已转义展示', !!(bar && bar.innerHTML.includes('宣传PV')));
-  assert('初始未展开面板（懒加载）', !!panel && !panel.classList.contains('is-open'));
+  assert('栏元素已创建（任何场景都不能没有栏）', !!bar);
+  assert('注册了 3 个油猴菜单项', menu.length === 3);
+  assert('注册了 1 个 click 委托处理器', (handlers.click || []).length === 1);
+
+  if (isNotice) {
+    // v0.2 最关键的两条回归：这两条失败路径以前是静默 hideAll()，
+    // 用户只会看到空白页，无从判断脚本到底有没有跑起来。
+    assert('失败路径渲染出通知样式 is-notice', !!hasCls(bar, 'is-notice'));
+    assert('失败路径走浮动兜底定位 is-float', !!hasCls(bar, 'is-float'));
+    assert('通知挂在 body 下（兜底挂载生效）', !!bar && documentStub.body.children.includes(bar));
+    assert('通知文字说明了当前状态', !!bar && bar.innerHTML.length > 40);
+    assert('通知带可点的恢复按钮', !!bar && bar.innerHTML.indexOf('b-ps-btn') >= 0);
+    assert('失败路径零弹幕请求', segCalls === 0);
+    assert('失败路径零在线人数请求', viewerCalls === 0);
+
+    if (SCENARIO === 'paused') {
+      assert('已暂停提示明确写出「已暂停」', !!bar && bar.innerHTML.includes('已暂停'));
+      assert('已暂停提示不误标红色错误', !!bar && !hasCls(bar, 'is-bad'));
+      assert('已暂停提示给出「重新启用」按钮', !!bar && bar.innerHTML.includes('data-act="enable"'));
+      assert('已暂停提示给出「忽略」按钮', !!bar && bar.innerHTML.includes('data-act="quiet"'));
+
+      // 恢复链路：点「重新启用」后必须真的把数据栏画回来
+      clickAct('enable');
+      setTimeout(() => {
+        const b2 = registry.get('b-ps-bar');
+        assert('点「重新启用」后通知样式被清掉', !!b2 && !hasCls(b2, 'is-notice'));
+        assert('点「重新启用」后恢复了浮动兜底以外的正常挂载', !!b2 && !hasCls(b2, 'is-float'));
+        assert('点「重新启用」后栏有正常内容', !!b2 && b2.innerHTML.length > 40);
+        assert('点「重新启用」后弹幕统计真的跑起来了', segCalls >= 1);
+        finish(undefined);
+      }, 2200);
+      return;
+    }
+
+    assert('取数失败提示标记为 is-bad', !!bar && hasCls(bar, 'is-bad'));
+    assert('取数失败提示明确写出「未显示」', !!bar && bar.innerHTML.includes('未显示'));
+    assert('取数失败提示写出了真实失败原因', !!bar && bar.innerHTML.includes('Failed to fetch'));
+    assert('取数失败提示给出「重试」按钮', !!bar && bar.innerHTML.includes('data-act="refresh"'));
+
+    // 重试链路：接口仍然失败时，通知必须继续可见，不能又变成空白
+    clickAct('refresh');
+    setTimeout(() => {
+      const b2 = registry.get('b-ps-bar');
+      assert('点「重试」后仍然可见（不是静默失败）', !!b2 && documentStub.body.children.includes(b2));
+      assert('点「重试」后仍是通知样式', !!b2 && hasCls(b2, 'is-notice') && hasCls(b2, 'is-bad'));
+      assert('点「重试」后仍给出可点按钮', !!b2 && b2.innerHTML.indexOf('b-ps-btn') >= 0);
+      finish(undefined);
+    }, 1600);
+    return;
+  }
+
+  const b = bar;
+  const p = panel;
+  assert('面板元素已创建', !!p);
+  assert('栏挂在标题容器之后', !!(titleBox._orphan || []).includes(b));
+  assert('面板紧挨在栏之后', !!(b._orphan || []).includes(p));
+  assert('栏有内容', b.innerHTML.length > 40);
+  assert('栏显示当前分P = P2（来自 ?p=2）', /P2/.test(b.innerHTML));
+  assert('当前分P标题已转义展示', b.innerHTML.includes('宣传PV'));
+  assert('初始未展开面板（懒加载）', !!p && !p.classList.contains('is-open'));
   // 精确取出弹幕单元格内容，避免用 includes 做模糊匹配
-  const m = bar ? String(bar.innerHTML).match(/弹幕 <b class="b-ps-num">([\s\S]*?)<\/b>/) : null;
+  const m = String(b.innerHTML).match(/弹幕 <b class="b-ps-num">([\s\S]*?)<\/b>/);
   const dmCell = m ? m[1] : '(未渲染)';
 
   if (SCENARIO === 'malformed') {
@@ -285,22 +352,21 @@ setTimeout(() => {
     assert('跑完全部分段时不标下界上标', dmCell.indexOf('⁺') < 0);
   }
   assert('当前分P请求次数与预期一致（' + EXPECT_SEG + '）', segCalls === EXPECT_SEG);
-  assert('在线人数在端点下线时降级为 —', !!(bar && bar.innerHTML.includes('在线 <b') && bar.innerHTML.indexOf('<span class="b-ps-dash">—</span>') >= 0));
-  assert('多分P才显示「全部分P」按钮', !!(bar && bar.innerHTML.includes('全部分P（2）')));
+  assert('在线人数在端点下线时降级为 —', !!(b.innerHTML.includes('在线 <b') && b.innerHTML.indexOf('<span class="b-ps-dash">—</span>') >= 0));
+  assert('多分P才显示「全部分P」按钮', !!b.innerHTML.includes('全部分P（2）'));
   assert('在线人数端点被调用过且熔断', viewerCalls >= 1);
   assert('缓存已写入 GM 存储', typeof store['bPsStore.v1'] === 'string');
-  assert('注册了 3 个油猴菜单项', menu.length === 3);
-  assert('注册了 1 个 click 委托处理器', (handlers.click || []).length === 1);
+  assert('油猴菜单含关闭/开启入口', !!menu.find((x) => x[0] === '关闭 / 开启分P数据栏'));
 
   // 点「统计全部分P」必须同时展开面板——此前只算数据不展开，用户会以为「没反应」
   clickAct('count-all');
-  assert('点「统计全部分P」后面板已展开', !!panel && panel.classList.contains('is-open'));
-  assert('面板渲染出 2 个分P的行', !!panel && (panel.innerHTML.match(/b-ps-row/g) || []).length === 2);
-  assert('面板高亮当前分P', !!panel && panel.innerHTML.includes('b-ps-cur'));
-  assert('面板显示全片总弹幕', !!panel && panel.innerHTML.includes('8040'));
+  assert('点「统计全部分P」后面板已展开', !!p && p.classList.contains('is-open'));
+  assert('面板渲染出 2 个分P的行', !!p && (p.innerHTML.match(/b-ps-row/g) || []).length === 2);
+  assert('面板高亮当前分P', !!p && p.innerHTML.includes('b-ps-cur'));
+  assert('面板显示全片总弹幕', !!p && p.innerHTML.includes('8040'));
 
   clickAct('toggle', true);
-  assert('点面板内的「×」后已收起', !!panel && !panel.classList.contains('is-open'));
+  assert('点面板内的「×」后已收起', !!p && !p.classList.contains('is-open'));
 
   // 等 countAll 把另一个分P也算完
   setTimeout(() => {

@@ -2,7 +2,7 @@
 // @name         Bilibili 分P数据补全
 // @name:en      Bilibili Part Stats
 // @namespace    https://github.com/kyo-zzz/bili-part-stats
-// @version      0.1.1
+// @version      0.2.0
 // @description  在 B 站视频标题下方补齐「每个分 P」的弹幕数与在线观看人数，补回官方改版后丢失的展示。
 // @description:en  Restores the per-part danmaku count and live viewer count below the video title on bilibili.com.
 // @author       kyo-zzz
@@ -116,12 +116,12 @@
     saveStore(store);
   }
 
-  async function fetchJSON(url, timeoutMs) {
+  async function fetchOnce(url, timeoutMs, credentials) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs || 9000);
     try {
       const res = await fetch(url, {
-        credentials: 'include',
+        credentials,
         signal: ctrl.signal,
         headers: { Accept: 'application/json, text/plain, */*' },
       });
@@ -130,6 +130,24 @@
     } finally {
       clearTimeout(timer);
     }
+  }
+
+  /**
+   * 默认先发带 cookie 的请求（弹幕分段接口需要 buvid3），
+   * 若被 CORS 拦下（服务端回 Access-Control-Allow-Origin: * 时 credentials:include 会被浏览器拒绝）
+   * 再退回到不带 cookie 重试一次。避免 CORS 组合问题让整个脚本静默消失。
+   */
+  async function fetchJSON(url, timeoutMs) {
+    const modes = ['include', 'omit'];
+    let lastErr;
+    for (const mode of modes) {
+      try {
+        return await fetchOnce(url, timeoutMs, mode);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr;
   }
 
   /** 12345 -> "1.2万"，与 B 站自身展示口径保持一致 */
@@ -329,6 +347,15 @@
 .b-ps-row{ cursor:pointer; }
 .b-ps-row:hover td{ background:var(--b-ps-bg); }
 .b-ps-row.b-ps-cur td{ background:#e6f3fd; }
+/* 找不到标题锚点时的兜底停靠位置，保证脚本永远至少能被看见一次 */
+#b-ps-bar.is-float{
+  position:fixed; left:12px; top:70px; z-index:999999; max-width:62vw;
+}
+#b-ps-bar.is-notice{
+  background:#fffbe6; border:1px solid #ffe58f; border-radius:6px;
+  padding:6px 10px; font-size:12px; line-height:1.5;
+}
+#b-ps-bar.is-notice.is-bad{ background:#fff1f0; border-color:#ffa39e; }
 `;
 
   function injectCss() {
@@ -339,18 +366,24 @@
     (document.head || document.documentElement).appendChild(style);
   }
 
-  /** 锚点：优先 B 站标题元素，失败则退回页面第一个 h1 */
+  /**
+   * 锚点：优先 B 站标题元素。
+   * 选择器列表刻意写宽 —— B 站改版频繁，宁可多试几种也不要静默不显示。
+   */
   function findAnchor() {
     const sels = [
       'h1.video-title__text',
       'h1.video-title',
       '.video-title h1',
       'h1[class*="title"]',
+      '.video-title',
+      '[class*="video-title"]',
       'h1',
+      '.title',
     ];
     for (const s of sels) {
       const el = document.querySelector(s);
-      if (el && el.textContent.trim().length > 0) return el;
+      if (el && el.textContent.trim().length > 1) return el;
     }
     return null;
   }
@@ -358,27 +391,52 @@
   /**
    * 把栏和面板作为兄弟节点挂在标题容器之后。
    * 栏和面板用两个独立容器 —— renderBar 清栏时不会连带清掉面板。
+   * 找不到标题锚点时退化为固定停靠（见 mountFloating），绝不静默消失。
    */
   function mount() {
     const anchor = findAnchor();
-    if (!anchor) return false;
+    if (!anchor) return mountFloating();
     const box = anchor.closest('.video-title') || anchor.parentElement;
-    if (!box) return false;
+    if (!box) return mountFloating();
 
     let bar = document.getElementById(BAR_ID);
     if (!bar) {
       bar = document.createElement('div');
       bar.id = BAR_ID;
-      box.insertAdjacentElement('afterend', bar);
     }
+    bar.classList.remove('is-float', 'is-notice', 'is-bad');
+    bar.style.cssText = '';
+    box.insertAdjacentElement('afterend', bar);
+
     let panel = document.getElementById(PANEL_ID);
     if (!panel) {
       panel = document.createElement('div');
       panel.id = PANEL_ID;
-      bar.insertAdjacentElement('afterend', panel);
-    } else if (panel.previousElementSibling !== bar) {
-      bar.insertAdjacentElement('afterend', panel);
     }
+    if (panel.previousElementSibling !== bar) bar.insertAdjacentElement('afterend', panel);
+    state.floating = false;
+    return true;
+  }
+
+  /** 标题锚点都找不到时的兜底：贴在视口左上，保证脚本永远至少能被看见一次 */
+  function mountFloating() {
+    const host = document.body || document.documentElement;
+    if (!host) return false;
+    let bar = document.getElementById(BAR_ID);
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = BAR_ID;
+    }
+    bar.classList.add('is-float');
+    host.appendChild(bar);
+
+    let panel = document.getElementById(PANEL_ID);
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = PANEL_ID;
+    }
+    if (panel.previousElementSibling !== bar) bar.insertAdjacentElement('afterend', panel);
+    state.floating = true;
     return true;
   }
 
@@ -389,9 +447,50 @@
     });
   }
 
+  /**
+   * 任何失败都要给出可见的原因，绝不 hideAll 后让用户对着空白页猜。
+   * 这是 v0.2 最关键的一条改动。
+   */
+  function showError(reason) {
+    injectCss();
+    hideAll();
+    if (!mountFloating()) return;
+    const bar = document.getElementById(BAR_ID);
+    if (!bar) return;
+    bar.classList.remove('is-notice', 'is-bad');
+    bar.classList.add('is-notice', 'is-bad');
+    bar.innerHTML =
+      '<b>分P数据</b> <span style="color:#cf1322">未显示</span> · ' +
+        escapeHtml(reason) +
+        ' <span class="b-ps-btn" data-act="refresh" style="margin-left:6px">重试</span>' +
+        '<span class="b-ps-btn" data-act="dismiss" style="margin-left:4px">忽略</span>';
+  }
+
+  /**
+   * 之前被手动关过（enabled: false）时的提示。
+   * 旧版本主栏上的「×」会把 enabled 持久化为 false，之后整个脚本静默不显示，
+   * 用户只会看到空白页。所以这个状态也必须可见、且能一键恢复。
+   */
+  function showPaused() {
+    injectCss();
+    hideAll();
+    if (!mountFloating()) return;
+    const bar = document.getElementById(BAR_ID);
+    if (!bar) return;
+    bar.classList.add('is-notice');
+    bar.innerHTML =
+      '<b>分P数据</b> <span style="color:#d48806">已暂停</span>' +
+        '（之前被关闭过，不会显示）' +
+        ' <span class="b-ps-btn" data-act="enable" style="margin-left:6px">重新启用</span>' +
+        '<span class="b-ps-btn" data-act="quiet" style="margin-left:4px">忽略</span>';
+  }
+
   function renderBar(v) {
     const bar = document.getElementById(BAR_ID);
     if (!bar) return;
+    // 清掉 showError / showPaused 留下的通知样式；is-float 由 mount / mountFloating 管理
+    bar.style.cssText = '';
+    bar.classList.remove('is-notice', 'is-bad');
     const cur = state.current;
     const multi = v.pages.length > 1;
     bar.innerHTML =
@@ -403,8 +502,7 @@
         ? '<span class="b-ps-btn" data-act="toggle">全部分P（' + v.pages.length + '） ▾</span>' +
           '<span class="b-ps-btn" data-act="count-all">统计全部分P</span>'
         : '') +
-      '<span class="b-ps-btn" data-act="refresh">刷新</span>' +
-      '<span class="b-ps-close" data-act="hide" title="本次关闭">×</span>';
+      '<span class="b-ps-btn" data-act="refresh">刷新</span>';
   }
 
   function renderPanel(v) {
@@ -484,7 +582,11 @@
     }
   }
 
-  /** 事件委托只装一次，栏和面板共用 */
+  /**
+   * 事件委托只装一次，栏和面板共用。
+   * 注意：主栏刻意不提供关闭按钮 —— 一次误点就会把脚本永久关掉，
+   * 用户只会看到一片空白然后来报「不显示了」。要持久关闭走 Tampermonkey 菜单。
+   */
   function wire() {
     document.addEventListener('click', (e) => {
       const actEl = e.target.closest('[data-act]');
@@ -496,10 +598,13 @@
           togglePanel(true);
           void countAll();
         } else if (act === 'refresh') void rebuild();
-        else if (act === 'hide') {
-          hideAll();
+        else if (act === 'dismiss') hideAll();
+        else if (act === 'quiet') { pausedQuiet = true; noticeUntil = 0; hideAll(); }
+        else if (act === 'enable') {
+          pausedQuiet = false; noticeUntil = 0;
           const c = cfg();
-          saveStore({ config: Object.assign({}, c, { enabled: false }) });
+          saveStore({ config: Object.assign({}, c, { enabled: true }) });
+          void rebuild();
         }
         return;
       }
@@ -518,6 +623,7 @@
     busy: new Set(),
     panelOpen: false,
     dirty: true,
+    floating: false,
   };
 
   /** 为单个 cid 取数：先缓存、再网络；同 cid 并发去重 */
@@ -603,8 +709,17 @@
     return changed;
   }
 
+  // 同一提示 30 秒内只画一次，否则 1 秒轮询会反复重建 DOM，按钮根本点不动
+  let noticeUntil = 0;
+  // 点过「忽略」后本页面会话内不再重复弹「已暂停」提示（enabled 仍为 false，只是不再打扰）
+  let pausedQuiet = false;
+
   async function rebuild() {
-    if (!cfg().enabled) return hideAll();
+    if (!cfg().enabled) {
+      if (pausedQuiet || noticeUntil > Date.now()) return;
+      noticeUntil = Date.now() + 30000;
+      return showPaused();
+    }
     injectCss();
     const bvid = currentBvid();
     if (!bvid) return hideAll();
@@ -626,13 +741,34 @@
     try {
       state.video = await loadVideo(bvid);
     } catch (err) {
+      if (noticeUntil > Date.now()) return;
+      noticeUntil = Date.now() + 30000;
+      const msg = err && err.message ? err.message : String(err);
       console.warn('[bilibili-part-stats] 视频数据加载失败：', err);
-      return hideAll();
+      // 显示不出来就必须说清楚为什么，而不是留一片空白让人猜
+      return showError('取不到视频数据（' + msg + '）');
+    }
+    if (!state.video.pages.length) {
+      if (noticeUntil <= Date.now()) {
+        noticeUntil = Date.now() + 30000;
+        showError('这个视频没有分 P 列表，可能不是普通投稿');
+      }
+      return;
     }
     await syncCurrent();
-    if (!mount()) return;
+    if (!state.current) {
+      if (noticeUntil <= Date.now()) {
+        noticeUntil = Date.now() + 30000;
+        showError('定位不到当前正在看的分 P');
+      }
+      return;
+    }
+    noticeUntil = 0;
+    mount();
     state.dirty = true;
     repaint();
+    console.log('[bilibili-part-stats] ready: ' + bvid +
+      ' 共 ' + state.video.pages.length + ' 个分P，当前 P' + state.current.page);
     if (cfg().autoAllParts && state.video.pages.length > 1) void countAll();
   }
 
@@ -679,8 +815,10 @@
   if (typeof GM_registerMenuCommand === 'function') {
     GM_registerMenuCommand('刷新当前视频数据', () => { saveStore({}); void rebuild(); });
     GM_registerMenuCommand('立即统计全部分P', () => void countAll());
-    GM_registerMenuCommand('显示 / 隐藏面板', () => {
+    GM_registerMenuCommand('关闭 / 开启分P数据栏', () => {
       const c = cfg();
+      pausedQuiet = false;
+      noticeUntil = 0;
       saveStore({ config: Object.assign({}, c, { enabled: !c.enabled }) });
       if (c.enabled) hideAll();
       else void rebuild();
