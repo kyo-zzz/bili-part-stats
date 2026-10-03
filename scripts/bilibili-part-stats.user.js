@@ -2,7 +2,7 @@
 // @name         Bilibili 分P数据补全
 // @name:en      Bilibili Part Stats
 // @namespace    https://github.com/kyo-zzz/bili-part-stats
-// @version      0.1.0
+// @version      0.1.1
 // @description  在 B 站视频标题下方补齐「每个分 P」的弹幕数与在线观看人数，补回官方改版后丢失的展示。
 // @description:en  Restores the per-part danmaku count and live viewer count below the video title on bilibili.com.
 // @author       kyo-zzz
@@ -491,8 +491,11 @@
       if (actEl && (actEl.closest('#b-ps-bar') || actEl.closest('#b-ps-panel'))) {
         const act = actEl.getAttribute('data-act');
         if (act === 'toggle') togglePanel();
-        else if (act === 'count-all') void countAll();
-        else if (act === 'refresh') void rebuild();
+        else if (act === 'count-all') {
+          // 只算数据不展开面板会让人误以为「没反应」，所以顺手打开
+          togglePanel(true);
+          void countAll();
+        } else if (act === 'refresh') void rebuild();
         else if (act === 'hide') {
           hideAll();
           const c = cfg();

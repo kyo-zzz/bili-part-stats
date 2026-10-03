@@ -4,7 +4,7 @@
 > 单文件 Tampermonkey 脚本，零依赖、零构建，复制到浏览器即用。
 
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
-[![version](https://img.shields.io/badge/version-0.1.0-green.svg)](./scripts/bilibili-part-stats.user.js)
+[![version](https://img.shields.io/badge/version-0.1.1-green.svg)](./scripts/bilibili-part-stats.user.js)
 [![tampermonkey](https://img.shields.io/badge/Tampermonkey-userscript-orange.svg)](https://www.tampermonkey.net/)
 
 ---
@@ -124,11 +124,23 @@ git push -u origin main
 
 ## 使用
 
-- 顶部行默认显示**当前分 P** 的弹幕数与在线人数。
-- 「全部分P（N）」展开明细表；「统计全部分P」会逐 P 排队统计（每个 P 约 5~20 次请求，会限速）。
-- 「刷新」丢弃缓存重新取数。
-- 「×」关闭本次显示，并写入设置，下次进页面不再显示；想恢复就用 Tampermonkey 菜单里的「显示 / 隐藏面板」。
-- Tampermonkey 图标菜单里还有：`刷新当前视频数据`、`立即统计全部分P`、`显示 / 隐藏面板`。
+脚本分两层，都在**视频标题正下方**：
+
+**主栏（常驻）** —— 紧接标题的一行，显示当前分 P 的序号、标题、弹幕数、在线观看人数，
+右侧是操作按钮。
+
+**明细面板（点开才出现）** —— 点主栏上的「全部分P（N）▾」，表格展开在**主栏正下方**，
+把 B 站自己的统计行往下顶。表格列出每个分 P 的标题 / 时长 / 弹幕数 / 在线观看人数，
+当前分 P 高亮，点任意一行直接跳到该分 P。
+
+操作说明：
+
+- **「全部分P（N）▾」** / 面板右上角「×」：展开 / 收起明细面板
+- **「统计全部分P」**：逐 P 排队统计（每个 P 约 5~20 次请求，带限速），并**自动展开面板**
+- **「刷新」**：丢弃缓存重新取数
+- **主栏右侧「×」**：关闭本次显示并写入设置，下次进页面不再显示；
+  想恢复就用 Tampermonkey 菜单里的「显示 / 隐藏面板」
+- Tampermonkey 图标菜单：`刷新当前视频数据` / `立即统计全部分P` / `显示 / 隐藏面板`
 
 ## 配置项
 
