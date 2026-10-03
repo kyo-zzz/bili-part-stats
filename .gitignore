@@ -1,0 +1,20 @@
+# 编辑器
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# 运行产物
+node_modules/
+dist/
+build/
+coverage/
+*.log
+
+# 本地临时文件
+.tmp/
+*.bak
+*.tmp
